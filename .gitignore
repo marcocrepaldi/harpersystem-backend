@@ -1,0 +1,52 @@
+# === Dependências ===
+node_modules/
+**/node_modules/
+.npm/
+.pnpm-store/
+.pnp.cjs
+.pnp.loader.mjs
+.pnp.*
+
+# === Build / Compilação ===
+dist/
+build/
+tmp/
+temp/
+
+# === Logs & caches ===
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+.eslintcache
+.cache/
+.turbo/
+
+# === Testes ===
+coverage/
+.nyc_output/
+
+# === Env (não versionar; mantenha apenas .env.example) ===
+.env
+.env.*
+!.env.example
+
+# === Prisma ===
+/generated/
+/generated/prisma
+/prisma/*.db
+/prisma/*.sqlite
+/prisma/*-journal
+
+# === TypeScript ===
+*.tsbuildinfo
+
+# === SO / Editor ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.tgz
