@@ -1,31 +1,25 @@
-// src/auth/guards/jwt-auth.guard.ts
-import {
-  ExecutionContext,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { ExecutionContext, Injectable } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
+import { Reflector } from '@nestjs/core';
+import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
 
 @Injectable()
 export class JwtAuthGuard extends AuthGuard('jwt') {
-  canActivate(context: ExecutionContext) {
-    return super.canActivate(context);
+  constructor(private readonly reflector: Reflector) {
+    super();
   }
 
-  // err: Error | undefined
-  // info: Error | string | undefined (passport-jwt preenche com erros conhecidos)
-  handleRequest(err: any, user: any, info?: any) {
-    if (err || !user) {
-      const name = info?.name ?? err?.name;
-      const rawMsg = typeof info === 'string' ? info : info?.message ?? err?.message;
+  canActivate(context: ExecutionContext) {
+    const isPublic =
+      this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]);
 
-      let message = 'Credenciais inválidas.';
-      if (name === 'TokenExpiredError') message = 'Token expirado.';
-      else if (name === 'JsonWebTokenError') message = 'Token inválido.';
-      else if (rawMsg && /no auth token/i.test(rawMsg)) message = 'Cabeçalho Authorization ausente.';
-
-      throw new UnauthorizedException(message);
+    if (isPublic) {
+      // pula autenticação para rotas públicas
+      return true;
     }
-    return user;
+    return super.canActivate(context);
   }
 }

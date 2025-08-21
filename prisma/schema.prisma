@@ -100,6 +100,8 @@ model Client {
 
   personType PersonType   @default(PF)
   status     ClientStatus @default(ACTIVE)
+
+  // LEGADO (a ser descontinuado após migração para tags normalizadas):
   tags       String[]     @default([])
 
   // endereço (legado)
@@ -151,9 +153,13 @@ model Client {
   regrasCobranca RegraCobranca[]
   faturas        FaturaImportada[]
 
-  // NOVO: relações normalizadas (Fase A)
+  // NORMALIZAÇÃO (Fase A)
   addresses Address[]
   contacts  Contact[]
+
+  // NOVO: relações normalizadas de serviços e tags
+  services ClientService[]   // many-to-many com Service
+  tagLinks ClientTag[]       // many-to-many com Tag (nome escolhido para não colidir com tags[] legado)
 
   @@unique([corretorId, id])
   // ⚠️ NÃO usamos mais @@unique para email/document aqui por causa do soft delete.
@@ -298,6 +304,58 @@ model Contact {
 
   @@index([clientId])
   @@map("contatos")
+}
+
+// ---------- SERVICES / TAGS (NOVO) ----------
+model Service {
+  id       String         @id @default(cuid())
+  slug     String         @unique           // ex.: SAUDE, ODONTO, VIDA, AUTO...
+  name     String
+  isActive Boolean        @default(true)
+
+  clients  ClientService[]
+
+  @@index([slug], map: "idx_service_slug")
+  @@index([name]) // auxiliar para ordenação/listagem no picker
+  @@map("services")
+}
+
+model ClientService {
+  clientId  String
+  serviceId String
+
+  client    Client  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([clientId, serviceId])
+  @@index([serviceId])
+  @@index([clientId]) // 🔎 busca rápida por cliente
+  @@map("client_services")
+}
+
+model Tag {
+  id       String     @id @default(cuid())
+  slug     String     @unique             // ex.: "vip", "sinistro-recente"
+  name     String
+  isActive Boolean    @default(true)
+
+  clients  ClientTag[]
+
+  @@index([name]) // auxiliar para ordenação/listagem
+  @@map("tags")
+}
+
+model ClientTag {
+  clientId String
+  tagId    String
+
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  tag      Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([clientId, tagId])
+  @@index([tagId])
+  @@index([clientId]) // 🔎 busca rápida por cliente
+  @@map("client_tags")
 }
 
 // ---------- AUDIT ----------

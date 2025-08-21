@@ -1,8 +1,8 @@
 import { Transform } from 'class-transformer';
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 
-function toInt({ value }: { value: unknown }) {
-  const n = parseInt(String(value), 10);
+function toInt({ value }: { value: any }) {
+  const n = parseInt(value, 10);
   return Number.isNaN(n) ? undefined : n;
 }
 
@@ -23,4 +23,9 @@ export class FindClientsQueryDto {
   @IsOptional()
   @IsString()
   search?: string;
+
+  // ⟵ NOVO: filtrar clientes por serviço contratado (slug)
+  @IsOptional()
+  @IsString()
+  service?: string;
 }

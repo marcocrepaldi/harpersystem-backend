@@ -15,26 +15,36 @@ import { CreateAddressDto, UpdateAddressDto } from './dto/address.dto';
 import { CreateContactDto, UpdateContactDto } from './dto/contact.dto';
 import { FindClientsQueryDto } from './dto/find-clients.dto';
 
-type IncludeKey = 'addresses' | 'contacts';
+type IncludeKey = 'addresses' | 'contacts' | 'services' | 'tags';
+
+/* --------------------------------- HELPERS --------------------------------- */
+
+function emptyToUndef<T>(v: T): T | undefined {
+  return typeof v === 'string' && v === '' ? undefined : v;
+}
+
+function cleanEmptyStrings<T extends Record<string, any>>(obj?: T): Partial<T> {
+  if (!obj) return {};
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(obj)) out[k] = v === '' ? undefined : v;
+  return out as Partial<T>;
+}
+
+function omitUndefined<T extends Record<string, any>>(obj: T): Partial<T> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(obj)) if (v !== undefined) out[k] = v;
+  return out as Partial<T>;
+}
 
 function mapStatus(s?: ClientStatusDto): ClientStatus | undefined {
   if (!s) return undefined;
-  switch (s) {
-    case 'lead':
-      return ClientStatus.LEAD;
-    case 'prospect':
-      return ClientStatus.PROSPECT;
-    case 'active':
-      return ClientStatus.ACTIVE;
-    case 'inactive':
-      return ClientStatus.INACTIVE;
-    default:
-      return undefined;
-  }
+  const key = String(s).toUpperCase() as keyof typeof ClientStatus;
+  return ClientStatus[key] ?? undefined;
 }
 
 function mapPersonType(p: PersonTypeDto): PersonType {
-  return p === 'PJ' ? PersonType.PJ : PersonType.PF;
+  const key = String(p).toUpperCase() as keyof typeof PersonType;
+  return PersonType[key] ?? PersonType.PF;
 }
 
 @Injectable()
@@ -44,7 +54,6 @@ export class ClientsService {
     private readonly audit: AuditService,
   ) {}
 
-  // ---------- HELPERS ----------
   private async ensureClientOwnership(clientId: string, corretorId: string): Promise<void> {
     const client = await this.prisma.client.findFirst({
       where: { id: clientId, corretorId },
@@ -54,14 +63,45 @@ export class ClientsService {
   }
 
   private buildInclude(includeRels: boolean | IncludeKey[] | undefined): Prisma.ClientInclude | undefined {
-    if (includeRels === true) return { addresses: true, contacts: true };
-    if (Array.isArray(includeRels)) {
+    if (includeRels === true) {
       return {
-        addresses: includeRels.includes('addresses'),
-        contacts: includeRels.includes('contacts'),
+        addresses: { orderBy: { createdAt: 'asc' } },
+        contacts: { orderBy: { createdAt: 'asc' } },
+        services: { include: { service: true } },
+        tagLinks: { include: { tag: true } },
       };
     }
+    if (Array.isArray(includeRels)) {
+      return {
+        addresses: includeRels.includes('addresses') ? { orderBy: { createdAt: 'asc' } } : false,
+        contacts: includeRels.includes('contacts') ? { orderBy: { createdAt: 'asc' } } : false,
+        services: includeRels.includes('services') ? { include: { service: true } } : false,
+        tagLinks: includeRels.includes('tags') ? { include: { tag: true } } : false,
+      } as Prisma.ClientInclude;
+    }
     return undefined;
+  }
+
+  private async mapServiceSlugsToCreate(slugs?: string[]) {
+    if (!slugs?.length) return [];
+    const services = await this.prisma.service.findMany({ where: { slug: { in: slugs } } });
+    if (!services.length) return [];
+    return services.map((s) => ({ service: { connect: { id: s.id } } }));
+  }
+
+  private async mapTagSlugsToCreate(slugs?: string[]) {
+    if (!slugs?.length) return [];
+    const rows: Array<{ id: string }> = [];
+    for (const slug of slugs) {
+      const name = slug.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+      const tag = await this.prisma.tag.upsert({
+        where: { slug },
+        update: { isActive: true },
+        create: { slug, name },
+      });
+      rows.push({ id: tag.id });
+    }
+    return rows.map((t) => ({ tag: { connect: { id: t.id } } }));
   }
 
   // ---------- LIST ----------
@@ -83,6 +123,9 @@ export class ClientsService {
             ],
           }
         : undefined),
+      ...(query.service
+        ? { services: { some: { service: { slug: query.service, isActive: true } } } }
+        : undefined),
     };
 
     const [items, total] = await this.prisma.$transaction([
@@ -92,14 +135,9 @@ export class ClientsService {
         take: limit,
         orderBy: { createdAt: 'desc' },
         select: {
-          id: true,
-          name: true,
-          email: true,
-          phone: true,
-          document: true,
-          birthDate: true,
-          createdAt: true,
-          updatedAt: true,
+          id: true, name: true, email: true, phone: true,
+          document: true, birthDate: true, status: true,
+          personType: true, createdAt: true, updatedAt: true,
         },
       }),
       this.prisma.client.count({ where }),
@@ -114,60 +152,127 @@ export class ClientsService {
     corretorId: string,
     includeRels: boolean | IncludeKey[] | undefined = false,
   ) {
+    const include = this.buildInclude(includeRels);
+
     const client = await this.prisma.client.findFirst({
-      where: { id, corretorId },
-      include: this.buildInclude(includeRels),
+      where: { id, corretorId, deletedAt: null },
+      include,
     });
     if (!client) throw new NotFoundException('Client not found');
-    return client;
+
+    const wantsServices =
+      includeRels === true || (Array.isArray(includeRels) && includeRels.includes('services'));
+    const wantsTags =
+      includeRels === true || (Array.isArray(includeRels) && includeRels.includes('tags'));
+
+    const address = {
+      zip: client.addressZip ?? undefined,
+      street: client.addressStreet ?? undefined,
+      number: client.addressNumber ?? undefined,
+      complement: client.addressComplement ?? undefined,
+      district: client.addressDistrict ?? undefined,
+      city: client.addressCity ?? undefined,
+      state: client.addressState ?? undefined,
+      country: client.addressCountry ?? undefined,
+    };
+
+    const primaryContact = {
+      name: client.primaryContactName ?? undefined,
+      role: client.primaryContactRole ?? undefined,
+      email: client.primaryContactEmail ?? undefined,
+      phone: client.primaryContactPhone ?? undefined,
+      notes: client.primaryContactNotes ?? undefined,
+    };
+
+    if (wantsServices || wantsTags) {
+      const [serviceLinks, tagLinks] = await Promise.all([
+        wantsServices
+          ? this.prisma.clientService.findMany({
+              where: { clientId: id },
+              include: { service: true },
+              orderBy: { service: { name: 'asc' } },
+            })
+          : Promise.resolve([] as Array<{ service: { slug: string } }>),
+        wantsTags
+          ? this.prisma.clientTag.findMany({
+              where: { clientId: id },
+              include: { tag: true },
+              orderBy: { tag: { name: 'asc' } },
+            })
+          : Promise.resolve([] as Array<{ tag: { slug: string } }>),
+      ]);
+
+      return {
+        ...client,
+        address,
+        primaryContact,
+        ...(wantsServices ? { serviceSlugs: serviceLinks.map((cs) => cs.service.slug) } : {}),
+        ...(wantsTags ? { tagSlugs: tagLinks.map((ct) => ct.tag.slug) } : {}),
+      };
+    }
+
+    return { ...client, address, primaryContact };
   }
 
   // ---------- CREATE ----------
   async create(corretorId: string, actorId: string, dto: CreateClientDto, req?: Request) {
     const data: Prisma.ClientCreateInput = {
       corretor: { connect: { id: corretorId } },
-      name: dto.name,
-      email: dto.email ?? undefined,
-      phone: dto.phone ?? undefined,
-      document: dto.document ?? undefined,
+      name: emptyToUndef(dto.name)!,
+      email: emptyToUndef(dto.email),
+      phone: emptyToUndef(dto.phone),
+      document: emptyToUndef(dto.document),
       personType: mapPersonType(dto.personType),
       status: mapStatus(dto.status) ?? ClientStatus.ACTIVE,
       tags: dto.tags ?? [],
       preferences: toJsonInput(dto.preferences),
       marketingOptIn: dto.marketingOptIn ?? false,
       privacyConsent: toJsonInput(dto.privacyConsent),
-      // Legados/normalizações de PF/PJ
-      pfRg: dto.pf?.rg ?? undefined,
+
+      // PF
+      pfRg: emptyToUndef(dto.pf?.rg),
       birthDate: dto.pf?.birthDate ? new Date(dto.pf.birthDate) : undefined,
-      pfMaritalStatus: dto.pf?.maritalStatus ?? undefined,
-      pfProfession: dto.pf?.profession ?? undefined,
+      pfMaritalStatus: emptyToUndef(dto.pf?.maritalStatus),
+      pfProfession: emptyToUndef(dto.pf?.profession),
       pfIsPEP: dto.pf?.isPEP ?? undefined,
-      pjCorporateName: dto.pj?.corporateName ?? undefined,
-      pjTradeName: dto.pj?.tradeName ?? undefined,
-      pjCnpj: dto.pj?.cnpj ?? undefined,
-      pjStateRegistration: dto.pj?.stateRegistration ?? undefined,
-      pjMunicipalRegistration: dto.pj?.municipalRegistration ?? undefined,
-      pjCNAE: dto.pj?.cnae ?? undefined,
+
+      // PJ
+      pjCorporateName: emptyToUndef(dto.pj?.corporateName),
+      pjTradeName: emptyToUndef(dto.pj?.tradeName),
+      pjCnpj: emptyToUndef(dto.pj?.cnpj),
+      pjStateRegistration: emptyToUndef(dto.pj?.stateRegistration),
+      pjMunicipalRegistration: emptyToUndef(dto.pj?.municipalRegistration),
+      pjCNAE: emptyToUndef(dto.pj?.cnae),
       pjFoundationDate: dto.pj?.foundationDate ? new Date(dto.pj.foundationDate) : undefined,
-      pjRepName: dto.pj?.legalRepresentative?.name ?? undefined,
-      pjRepCpf: dto.pj?.legalRepresentative?.cpf ?? undefined,
-      pjRepEmail: dto.pj?.legalRepresentative?.email ?? undefined,
-      pjRepPhone: dto.pj?.legalRepresentative?.phone ?? undefined,
+      pjRepName: emptyToUndef(dto.pj?.legalRepresentative?.name),
+      pjRepCpf: emptyToUndef(dto.pj?.legalRepresentative?.cpf),
+      pjRepEmail: emptyToUndef(dto.pj?.legalRepresentative?.email),
+      pjRepPhone: emptyToUndef(dto.pj?.legalRepresentative?.phone),
+
       // Contato principal (legado)
-      primaryContactName: dto.primaryContact?.name ?? undefined,
-      primaryContactRole: dto.primaryContact?.role ?? undefined,
-      primaryContactEmail: dto.primaryContact?.email ?? undefined,
-      primaryContactPhone: dto.primaryContact?.phone ?? undefined,
-      primaryContactNotes: dto.primaryContact?.notes ?? undefined,
-      // Endereço legado (mínimo)
-      addressZip: dto.address?.zip ?? undefined,
-      addressStreet: dto.address?.street ?? undefined,
-      addressNumber: dto.address?.number ?? undefined,
-      addressComplement: dto.address?.complement ?? undefined,
-      addressDistrict: dto.address?.district ?? undefined,
-      addressCity: dto.address?.city ?? undefined,
-      addressState: dto.address?.state ?? undefined,
-      addressCountry: dto.address?.country ?? undefined,
+      primaryContactName: emptyToUndef(dto.primaryContact?.name),
+      primaryContactRole: emptyToUndef(dto.primaryContact?.role),
+      primaryContactEmail: emptyToUndef(dto.primaryContact?.email),
+      primaryContactPhone: emptyToUndef(dto.primaryContact?.phone),
+      primaryContactNotes: emptyToUndef(dto.primaryContact?.notes),
+
+      // Endereço legado
+      addressZip: emptyToUndef(dto.address?.zip),
+      addressStreet: emptyToUndef(dto.address?.street),
+      addressNumber: emptyToUndef(dto.address?.number),
+      addressComplement: emptyToUndef(dto.address?.complement),
+      addressDistrict: emptyToUndef(dto.address?.district),
+      addressCity: emptyToUndef(dto.address?.city),
+      addressState: emptyToUndef(dto.address?.state),
+      addressCountry: emptyToUndef(dto.address?.country),
+
+      // N:N — cria apenas se vierem definidos
+      ...(dto.serviceSlugs !== undefined && {
+        services: { create: await this.mapServiceSlugsToCreate(dto.serviceSlugs) },
+      }),
+      ...(dto.tags !== undefined && {
+        tagLinks: { create: await this.mapTagSlugsToCreate(dto.tags) },
+      }),
     };
 
     const created = await this.prisma.client.create({ data });
@@ -199,56 +304,72 @@ export class ClientsService {
       }
     }
 
-    const data: Prisma.ClientUpdateInput = {
-      name: dto.name ?? undefined,
-      email: dto.email ?? undefined,
-      phone: dto.phone ?? undefined,
-      document: dto.document ?? undefined,
+    const base: Prisma.ClientUpdateInput = omitUndefined({
+      name: emptyToUndef(dto.name),
+      email: emptyToUndef(dto.email),
+      phone: emptyToUndef(dto.phone),
+      document: emptyToUndef(dto.document),
       personType: dto.personType ? mapPersonType(dto.personType) : undefined,
       status: mapStatus(dto.status),
-      tags: dto.tags ? { set: dto.tags } : undefined,
+
+      ...(dto.tags !== undefined ? { tags: { set: dto.tags } } : {}),
+
       preferences: toJsonInput(dto.preferences),
       marketingOptIn: dto.marketingOptIn ?? undefined,
       privacyConsent: toJsonInput(dto.privacyConsent),
-      // PF
-      pfRg: dto.pf?.rg ?? undefined,
-      birthDate: dto.pf?.birthDate ? new Date(dto.pf.birthDate) : undefined,
-      pfMaritalStatus: dto.pf?.maritalStatus ?? undefined,
-      pfProfession: dto.pf?.profession ?? undefined,
-      pfIsPEP: dto.pf?.isPEP ?? undefined,
-      // PJ
-      pjCorporateName: dto.pj?.corporateName ?? undefined,
-      pjTradeName: dto.pj?.tradeName ?? undefined,
-      pjCnpj: dto.pj?.cnpj ?? undefined,
-      pjStateRegistration: dto.pj?.stateRegistration ?? undefined,
-      pjMunicipalRegistration: dto.pj?.municipalRegistration ?? undefined,
-      pjCNAE: dto.pj?.cnae ?? undefined,
-      pjFoundationDate: dto.pj?.foundationDate ? new Date(dto.pj.foundationDate) : undefined,
-      pjRepName: dto.pj?.legalRepresentative?.name ?? undefined,
-      pjRepCpf: dto.pj?.legalRepresentative?.cpf ?? undefined,
-      pjRepEmail: dto.pj?.legalRepresentative?.email ?? undefined,
-      pjRepPhone: dto.pj?.legalRepresentative?.phone ?? undefined,
-      // Contato principal (legado)
-      primaryContactName: dto.primaryContact?.name ?? undefined,
-      primaryContactRole: dto.primaryContact?.role ?? undefined,
-      primaryContactEmail: dto.primaryContact?.email ?? undefined,
-      primaryContactPhone: dto.primaryContact?.phone ?? undefined,
-      primaryContactNotes: dto.primaryContact?.notes ?? undefined,
-      // Endereço legado
-      addressZip: dto.address?.zip ?? undefined,
-      addressStreet: dto.address?.street ?? undefined,
-      addressNumber: dto.address?.number ?? undefined,
-      addressComplement: dto.address?.complement ?? undefined,
-      addressDistrict: dto.address?.district ?? undefined,
-      addressCity: dto.address?.city ?? undefined,
-      addressState: dto.address?.state ?? undefined,
-      addressCountry: dto.address?.country ?? undefined,
-    };
 
-    const updated = await this.prisma.client.update({
-      where: { id },
-      data,
+      // PF
+      pfRg: emptyToUndef(dto.pf?.rg),
+      birthDate: dto.pf?.birthDate ? new Date(dto.pf.birthDate) : undefined,
+      pfMaritalStatus: emptyToUndef(dto.pf?.maritalStatus),
+      pfProfession: emptyToUndef(dto.pf?.profession),
+      pfIsPEP: dto.pf?.isPEP ?? undefined,
+
+      // PJ
+      pjCorporateName: emptyToUndef(dto.pj?.corporateName),
+      pjTradeName: emptyToUndef(dto.pj?.tradeName),
+      pjCnpj: emptyToUndef(dto.pj?.cnpj),
+      pjStateRegistration: emptyToUndef(dto.pj?.stateRegistration),
+      pjMunicipalRegistration: emptyToUndef(dto.pj?.municipalRegistration),
+      pjCNAE: emptyToUndef(dto.pj?.cnae),
+      pjFoundationDate: dto.pj?.foundationDate ? new Date(dto.pj.foundationDate) : undefined,
+      pjRepName: emptyToUndef(dto.pj?.legalRepresentative?.name),
+      pjRepCpf: emptyToUndef(dto.pj?.legalRepresentative?.cpf),
+      pjRepEmail: emptyToUndef(dto.pj?.legalRepresentative?.email),
+      pjRepPhone: emptyToUndef(dto.pj?.legalRepresentative?.phone),
+
+      // Contato principal (legado)
+      primaryContactName: emptyToUndef(dto.primaryContact?.name),
+      primaryContactRole: emptyToUndef(dto.primaryContact?.role),
+      primaryContactEmail: emptyToUndef(dto.primaryContact?.email),
+      primaryContactPhone: emptyToUndef(dto.primaryContact?.phone),
+      primaryContactNotes: emptyToUndef(dto.primaryContact?.notes),
+
+      // Endereço legado
+      addressZip: emptyToUndef(dto.address?.zip),
+      addressStreet: emptyToUndef(dto.address?.street),
+      addressNumber: emptyToUndef(dto.address?.number),
+      addressComplement: emptyToUndef(dto.address?.complement),
+      addressDistrict: emptyToUndef(dto.address?.district),
+      addressCity: emptyToUndef(dto.address?.city),
+      addressState: emptyToUndef(dto.address?.state),
+      addressCountry: emptyToUndef(dto.address?.country),
     });
+
+    if (dto.serviceSlugs !== undefined) {
+      base.services = {
+        deleteMany: {},
+        create: await this.mapServiceSlugsToCreate(dto.serviceSlugs),
+      };
+    }
+    if (dto.tags !== undefined) {
+      base.tagLinks = {
+        deleteMany: {},
+        create: await this.mapTagSlugsToCreate(dto.tags),
+      };
+    }
+
+    const updated = await this.prisma.client.update({ where: { id }, data: base });
 
     await this.audit.log({
       corretorId,
@@ -275,14 +396,8 @@ export class ClientsService {
     });
 
     await this.audit.log({
-      corretorId,
-      entity: 'client',
-      entityId: id,
-      action: 'DELETE',
-      before: existing,
-      after: updated,
-      actorId,
-      req,
+      corretorId, entity: 'client', entityId: id,
+      action: 'DELETE', before: existing, after: updated, actorId, req,
     });
 
     return { ok: true };
@@ -298,14 +413,8 @@ export class ClientsService {
     });
 
     await this.audit.log({
-      corretorId,
-      entity: 'client',
-      entityId: id,
-      action: 'RESTORE',
-      before: existing,
-      after: updated,
-      actorId,
-      req,
+      corretorId, entity: 'client', entityId: id,
+      action: 'RESTORE', before: existing, after: updated, actorId, req,
     });
 
     return { ok: true };
@@ -321,45 +430,31 @@ export class ClientsService {
 
   async createAddress(clientId: string, corretorId: string, actorId: string, dto: CreateAddressDto, req?: Request) {
     await this.ensureClientOwnership(clientId, corretorId);
-    const created = await this.prisma.address.create({ data: { clientId, ...dto } });
+    const cleaned = omitUndefined(cleanEmptyStrings(dto));
+    const created = await this.prisma.address.create({ data: { clientId, ...cleaned } });
 
     await this.audit.log({
-      corretorId,
-      entity: 'address',
-      entityId: created.id,
-      action: 'CREATE',
-      before: null,
-      after: created,
-      actorId,
-      req,
+      corretorId, entity: 'address', entityId: created.id,
+      action: 'CREATE', before: null, after: created, actorId, req,
     });
 
     return created;
   }
 
   async updateAddress(
-    clientId: string,
-    addressId: string,
-    corretorId: string,
-    actorId: string,
-    dto: UpdateAddressDto,
-    req?: Request,
+    clientId: string, addressId: string, corretorId: string,
+    actorId: string, dto: UpdateAddressDto, req?: Request,
   ) {
     await this.ensureClientOwnership(clientId, corretorId);
     const existing = await this.prisma.address.findUnique({ where: { id: addressId } });
     if (!existing || existing.clientId !== clientId) throw new NotFoundException('Address not found');
 
-    const updated = await this.prisma.address.update({ where: { id: addressId }, data: dto });
+    const cleaned = omitUndefined(cleanEmptyStrings(dto));
+    const updated = await this.prisma.address.update({ where: { id: addressId }, data: cleaned });
 
     await this.audit.log({
-      corretorId,
-      entity: 'address',
-      entityId: addressId,
-      action: 'UPDATE',
-      before: existing,
-      after: updated,
-      actorId,
-      req,
+      corretorId, entity: 'address', entityId: addressId,
+      action: 'UPDATE', before: existing, after: updated, actorId, req,
     });
 
     return updated;
@@ -373,14 +468,8 @@ export class ClientsService {
     await this.prisma.address.delete({ where: { id: addressId } });
 
     await this.audit.log({
-      corretorId,
-      entity: 'address',
-      entityId: addressId,
-      action: 'DELETE',
-      before: existing,
-      after: null,
-      actorId,
-      req,
+      corretorId, entity: 'address', entityId: addressId,
+      action: 'DELETE', before: existing, after: null, actorId, req,
     });
 
     return { ok: true };
@@ -399,29 +488,20 @@ export class ClientsService {
     if (dto.isPrimary) {
       await this.prisma.contact.updateMany({ where: { clientId, isPrimary: true }, data: { isPrimary: false } });
     }
-    const created = await this.prisma.contact.create({ data: { clientId, ...dto } });
+    const cleaned = omitUndefined(cleanEmptyStrings(dto));
+    const created = await this.prisma.contact.create({ data: { clientId, ...cleaned } });
 
     await this.audit.log({
-      corretorId,
-      entity: 'contact',
-      entityId: created.id,
-      action: 'CREATE',
-      before: null,
-      after: created,
-      actorId,
-      req,
+      corretorId, entity: 'contact', entityId: created.id,
+      action: 'CREATE', before: null, after: created, actorId, req,
     });
 
     return created;
   }
 
   async updateContact(
-    clientId: string,
-    contactId: string,
-    corretorId: string,
-    actorId: string,
-    dto: UpdateContactDto,
-    req?: Request,
+    clientId: string, contactId: string, corretorId: string,
+    actorId: string, dto: UpdateContactDto, req?: Request,
   ) {
     await this.ensureClientOwnership(clientId, corretorId);
     const existing = await this.prisma.contact.findUnique({ where: { id: contactId } });
@@ -434,17 +514,12 @@ export class ClientsService {
       });
     }
 
-    const updated = await this.prisma.contact.update({ where: { id: contactId }, data: dto });
+    const cleaned = omitUndefined(cleanEmptyStrings(dto));
+    const updated = await this.prisma.contact.update({ where: { id: contactId }, data: cleaned });
 
     await this.audit.log({
-      corretorId,
-      entity: 'contact',
-      entityId: contactId,
-      action: 'UPDATE',
-      before: existing,
-      after: updated,
-      actorId,
-      req,
+      corretorId, entity: 'contact', entityId: contactId,
+      action: 'UPDATE', before: existing, after: updated, actorId, req,
     });
 
     return updated;
@@ -458,14 +533,8 @@ export class ClientsService {
     await this.prisma.contact.delete({ where: { id: contactId } });
 
     await this.audit.log({
-      corretorId,
-      entity: 'contact',
-      entityId: contactId,
-      action: 'DELETE',
-      before: existing,
-      after: null,
-      actorId,
-      req,
+      corretorId, entity: 'contact', entityId: contactId,
+      action: 'DELETE', before: existing, after: null, actorId, req,
     });
 
     return { ok: true };

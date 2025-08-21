@@ -28,17 +28,22 @@ type RequestUser = {
   corretorId: string;
 };
 
-type IncludeKey = 'addresses' | 'contacts';
+type IncludeKey = 'addresses' | 'contacts' | 'services' | 'tags';
 
-function parseIncludeRels(value?: string): boolean | IncludeKey[] | undefined {
+/**
+ * Aceita:
+ *  - "true" | "all" | "*"  -> true (traz todas as relações)
+ *  - "addresses,contacts"  -> lista específica
+ *  - "false" | vazio       -> false (sem relações)
+ *  - undefined              -> DEFAULT = true (ótimo para tela de edição)
+ */
+function parseIncludeRels(value?: string): boolean | IncludeKey[] | false | undefined {
   if (value === undefined) return undefined;
-  if (value === 'true') return true;
-  if (!value) return undefined;
-  const parts = value
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean) as IncludeKey[];
-  return parts.length ? parts : undefined;
+  const v = (value || '').trim().toLowerCase();
+  if (v === 'true' || v === 'all' || v === '*') return true;
+  if (v === 'false' || v === '') return false;
+  const parts = v.split(',').map((s) => s.trim()).filter(Boolean) as IncludeKey[];
+  return parts.length ? parts : false;
 }
 
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -46,30 +51,27 @@ function parseIncludeRels(value?: string): boolean | IncludeKey[] | undefined {
 export class ClientsController {
   constructor(private readonly service: ClientsService) {}
 
-  // Listagem com paginação
   @Get()
   findMany(@Query() query: FindClientsQueryDto, @CurrentUser() user: RequestUser) {
     return this.service.findForTenant(user.corretorId, query);
   }
 
-  // Criar
   @Post()
   create(@Body() dto: CreateClientDto, @CurrentUser() user: RequestUser, @Req() req: Request) {
     return this.service.create(user.corretorId, user.id, dto, req);
   }
 
-  // Buscar 1 (com include opcional)
   @Get(':id')
   getOne(
     @Param('id') id: string,
     @CurrentUser() user: RequestUser,
     @Query('includeRels') includeRelsParam?: string,
   ) {
-    const includeRels = parseIncludeRels(includeRelsParam);
+    const parsed = parseIncludeRels(includeRelsParam);
+    const includeRels = parsed === undefined ? true : parsed; // default=TRUE (pré-preencher edição)
     return this.service.getByIdForTenant(id, user.corretorId, includeRels);
   }
 
-  // Atualizar
   @Patch(':id')
   update(
     @Param('id') id: string,
@@ -80,13 +82,11 @@ export class ClientsController {
     return this.service.update(id, user.corretorId, user.id, dto, req);
   }
 
-  // Soft delete
   @Delete(':id')
   remove(@Param('id') id: string, @CurrentUser() user: RequestUser, @Req() req: Request) {
     return this.service.softDelete(id, user.corretorId, user.id, req);
   }
 
-  // Restore
   @Post(':id/restore')
   restore(@Param('id') id: string, @CurrentUser() user: RequestUser, @Req() req: Request) {
     return this.service.restore(id, user.corretorId, user.id, req);

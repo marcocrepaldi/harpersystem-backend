@@ -122,6 +122,12 @@ export class CreateClientDto {
   @IsString({ each: true })
   tags?: string[];
 
+  // ⟵ NOVO: serviços contratados (slugs)
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  serviceSlugs?: string[];
+
   @IsOptional() @IsObject() preferences?: Record<string, unknown>;
   @IsOptional() @IsBoolean() marketingOptIn?: boolean;
   @IsOptional() @IsObject() privacyConsent?: Record<string, unknown>;

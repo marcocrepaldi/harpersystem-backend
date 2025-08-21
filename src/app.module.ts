@@ -12,6 +12,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ClientsModule } from './clients/clients.module';
 import { PoliciesModule } from './policies/policies.module';
+import { ServicesModule } from './services/services.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { PoliciesModule } from './policies/policies.module';
     AuthModule,
     ClientsModule,
     PoliciesModule,
+    ServicesModule
   ],
   controllers: [AppController],
   providers: [
