@@ -1,5 +1,11 @@
 import { Transform } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+
+// Enum para garantir que o filtro 'tipo' só aceite os valores corretos
+enum BeneficiarioTipoDto {
+  TITULAR = 'TITULAR',
+  DEPENDENTE = 'DEPENDENTE',
+}
 
 // Helper para transformar string em número para validação
 const toInt = ({ value }: { value: unknown }) => {
@@ -18,10 +24,15 @@ export class FindBeneficiariesQueryDto {
   @Transform(toInt)
   @IsInt()
   @Min(1)
-  @Max(100)
+  @Max(500)
   limit = 10;
 
   @IsOptional()
   @IsString()
   search?: string;
+
+  // ✅ CAMPO QUE FALTAVA ADICIONADO AQUI
+  @IsOptional()
+  @IsEnum(BeneficiarioTipoDto, { message: 'O tipo deve ser TITULAR ou DEPENDENTE.' })
+  tipo?: BeneficiarioTipoDto;
 }

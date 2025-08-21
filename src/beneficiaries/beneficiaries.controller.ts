@@ -2,6 +2,8 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
+  Delete,
   Param,
   Query,
   Body,
@@ -9,18 +11,23 @@ import {
   UploadedFile,
   ParseFilePipe,
   MaxFileSizeValidator,
+  NotFoundException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { BeneficiariesService } from './beneficiaries.service';
 import { FindBeneficiariesQueryDto } from './dto/find-beneficiaries.dto';
+import { CreateBeneficiaryDto } from './dto/create-beneficiary.dto';
+// Futuramente: import { UpdateBeneficiaryDto } from './dto/update-beneficiary.dto';
 
-// ✅ CORREÇÃO: Adicionado o prefixo 'api/' para bater com a chamada do frontend
+// Rota correta, que será prefixada pelo '/api' global do main.ts
 @Controller('clients/:clientId/beneficiaries')
 export class BeneficiariesController {
   constructor(private readonly beneficiariesService: BeneficiariesService) {}
 
-  // Rota para listar os beneficiários (com paginação e busca)
-  // GET /api/clients/:clientId/beneficiaries?search=...&page=1
+  /**
+   * Lista todos os beneficiários de um cliente com paginação e busca.
+   * GET /api/clients/:clientId/beneficiaries
+   */
   @Get()
   findMany(
     @Param('clientId') clientId: string,
@@ -29,16 +36,17 @@ export class BeneficiariesController {
     return this.beneficiariesService.findMany(clientId, query);
   }
 
-  // Rota para o upload do arquivo de importação
-  // POST /api/clients/:clientId/beneficiaries/upload
+  /**
+   * Recebe um arquivo (CSV/XLSX) para importação em massa.
+   * POST /api/clients/:clientId/beneficiaries/upload
+   */
   @Post('upload')
-  @UseInterceptors(FileInterceptor('file')) // 'file' é o nome do campo no formulário
+  @UseInterceptors(FileInterceptor('file'))
   async uploadFile(
     @Param('clientId') clientId: string,
     @UploadedFile(
-      // Validações básicas do arquivo (opcional, mas recomendado)
       new ParseFilePipe({
-        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })], // ex: 10MB
+        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })], // Limite: 50MB
       }),
     )
     file: Express.Multer.File,
@@ -46,12 +54,56 @@ export class BeneficiariesController {
     return this.beneficiariesService.processUpload(clientId, file);
   }
 
-  // Rota para criar um beneficiário manualmente ("vida por vida")
-  // POST /api/clients/:clientId/beneficiaries
+  /**
+   * Cria um novo beneficiário ("vida por vida").
+   * POST /api/clients/:clientId/beneficiaries
+   */
   @Post()
-  create(@Param('clientId') clientId: string, @Body() createDto: any) {
-    // A implementação deste método será nosso próximo passo
-    console.log(`Criando novo beneficiário para o cliente ${clientId}:`, createDto);
-    return { message: 'Endpoint de criação pronto.', clientId, data: createDto };
+  create(
+    @Param('clientId') clientId: string,
+    @Body() createDto: CreateBeneficiaryDto,
+  ) {
+    // A validação do DTO é feita automaticamente pelo ValidationPipe global
+    return this.beneficiariesService.create(clientId, createDto);
+  }
+
+  /**
+   * Busca um beneficiário específico pelo seu ID.
+   * GET /api/clients/:clientId/beneficiaries/:beneficiaryId
+   */
+  @Get(':beneficiaryId')
+  findOne(
+    @Param('clientId') clientId: string,
+    @Param('beneficiaryId') beneficiaryId: string,
+  ) {
+    // return this.beneficiariesService.findOne(clientId, beneficiaryId);
+    throw new NotFoundException('Endpoint de busca individual ainda não implementado.');
+  }
+
+  /**
+   * Atualiza um beneficiário específico.
+   * PATCH /api/clients/:clientId/beneficiaries/:beneficiaryId
+   */
+  @Patch(':beneficiaryId')
+  update(
+    @Param('clientId') clientId: string,
+    @Param('beneficiaryId') beneficiaryId: string,
+    @Body() updateDto: any, // Substituir por UpdateBeneficiaryDto
+  ) {
+    // return this.beneficiariesService.update(clientId, beneficiaryId, updateDto);
+    throw new NotFoundException('Endpoint de atualização ainda não implementado.');
+  }
+
+  /**
+   * Exclui um beneficiário específico.
+   * DELETE /api/clients/:clientId/beneficiaries/:beneficiaryId
+   */
+  @Delete(':beneficiaryId')
+  remove(
+    @Param('clientId') clientId: string,
+    @Param('beneficiaryId') beneficiaryId: string,
+  ) {
+    // return this.beneficiariesService.remove(clientId, beneficiaryId);
+    throw new NotFoundException('Endpoint de exclusão individual ainda não implementado.');
   }
 }
