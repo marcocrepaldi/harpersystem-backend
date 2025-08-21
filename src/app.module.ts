@@ -13,6 +13,7 @@ import { AppService } from './app.service';
 import { ClientsModule } from './clients/clients.module';
 import { PoliciesModule } from './policies/policies.module';
 import { ServicesModule } from './services/services.module';
+import { BeneficiariesModule } from './beneficiaries/beneficiaries.module';
 
 @Module({
   imports: [
@@ -25,7 +26,8 @@ import { ServicesModule } from './services/services.module';
     AuthModule,
     ClientsModule,
     PoliciesModule,
-    ServicesModule
+    ServicesModule,
+    BeneficiariesModule
   ],
   controllers: [AppController],
   providers: [
