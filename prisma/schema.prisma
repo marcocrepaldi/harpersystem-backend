@@ -223,22 +223,24 @@ model Beneficiario {
   titular     Beneficiario?  @relation("TitularDependentes", fields: [titularId], references: [id], onDelete: SetNull)
   dependentes Beneficiario[] @relation("TitularDependentes")
 
-  // --- Campos existentes ---
+  // --- Campos do Arquivo ---
   nomeCompleto     String
   cpf              String?            @db.VarChar(14)
   tipo             BeneficiarioTipo
-  dataEntrada      DateTime
+  dataEntrada      DateTime           // VIGENCIA
   dataSaida        DateTime?
   valorMensalidade Decimal?           @db.Decimal(10, 2)
   status           BeneficiarioStatus @default(ATIVO)
-
-  // --- ✅ NOVOS CAMPOS ADICIONADOS ---
-  matricula        String? // MATRÍCULA
-  carteirinha      String? // CARTEIRINHA
-  sexo             String? @db.VarChar(1) // SEXO (M/F)
-  dataNascimento   DateTime? // DATA DE NASCIMENTO
-  plano            String? // PLANO
-  centroCusto      String? // CENTRO DE CUSTO
+  matricula        String?
+  carteirinha      String?
+  sexo             String?            @db.VarChar(1)
+  dataNascimento   DateTime?
+  plano            String?
+  centroCusto      String?
+  faixaEtaria      String?
+  estado           String?
+  contrato         String?
+  comentario       String?            // AÇÃO virou comentário
 
   regraCobrancaId String?
   regraCobranca   RegraCobranca? @relation(fields: [regraCobrancaId], references: [id], onDelete: SetNull)
@@ -247,10 +249,7 @@ model Beneficiario {
   updatedAt DateTime @updatedAt
 
   @@unique([clientId, cpf])
-  @@index([clientId, tipo])
-  @@index([clientId, status])
-  @@index([clientId, titularId])
-  @@index([clientId, matricula]) // Adicionando índice para busca por matrícula
+  @@index([clientId, matricula])
   @@map("health_beneficiaries")
 }
 
@@ -384,3 +383,4 @@ model AuditLog {
   @@index([corretorId, entity, entityId, at])
   @@map("audit_log")
 }
+

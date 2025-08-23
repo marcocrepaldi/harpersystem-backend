@@ -4,61 +4,87 @@ import {
   IsOptional,
   IsEnum,
   IsDateString,
-  IsNumberString,
   IsUUID,
-  Length,
+  Matches,
+  ValidateIf,
+  Validate,
+  ValidationArguments,
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
 } from 'class-validator';
+import { Transform } from 'class-transformer';
 
-enum BeneficiarioTipoDto {
-  TITULAR = 'TITULAR',
-  DEPENDENTE = 'DEPENDENTE',
+export enum BeneficiarioTipoDto { TITULAR = 'TITULAR', DEPENDENTE = 'DEPENDENTE' }
+export enum SexoDto { M = 'M', F = 'F' }
+
+/**
+ * Regra de consistência:
+ * - Se tipo = DEPENDENTE => titularId é obrigatório.
+ * - Se tipo = TITULAR => titularId NÃO deve ser informado.
+ */
+@ValidatorConstraint({ name: 'TitularDependenteConsistency', async: false })
+export class TitularDependenteConsistency implements ValidatorConstraintInterface {
+  validate(value: unknown, args: ValidationArguments): boolean {
+    const o = args.object as CreateBeneficiaryDto;
+
+    if (o.tipo === BeneficiarioTipoDto.DEPENDENTE) {
+      return typeof value === 'string' && value.length > 0;
+    }
+    if (o.tipo === BeneficiarioTipoDto.TITULAR) {
+      return value === undefined || value === null || value === '';
+    }
+    return true;
+  }
+  defaultMessage(args: ValidationArguments): string {
+    const o = args.object as CreateBeneficiaryDto;
+    if (o.tipo === BeneficiarioTipoDto.DEPENDENTE) {
+      return 'titularId é obrigatório quando tipo = DEPENDENTE.';
+    }
+    return 'titularId não deve ser informado quando tipo = TITULAR.';
+  }
 }
 
-// ✅ NOVO: Enum para o campo 'sexo'
-enum SexoDto {
-  M = 'M',
-  F = 'F',
+function trim(v: any) {
+  return typeof v === 'string' ? v.trim() : v;
 }
 
 export class CreateBeneficiaryDto {
   @IsString()
   @IsNotEmpty({ message: 'O nome completo é obrigatório.' })
-  nomeCompleto: string;
+  @Transform(({ value }) => trim(value))
+  nomeCompleto!: string;
 
-  @IsString()
   @IsOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.replace(/\D/g, '').trim() : value))
+  @Matches(/^\d{11}$/, { message: 'CPF deve conter exatamente 11 dígitos numéricos.' })
   cpf?: string;
 
   @IsEnum(BeneficiarioTipoDto)
-  @IsNotEmpty({ message: 'O tipo (Titular/Dependente) é obrigatório.' })
-  tipo: BeneficiarioTipoDto;
+  @IsNotEmpty()
+  tipo!: BeneficiarioTipoDto;
 
   @IsDateString()
-  @IsNotEmpty({ message: 'A data de entrada é obrigatória.' })
-  dataEntrada: string;
+  @IsNotEmpty()
+  dataEntrada!: string; // ISO 8601 (ex: 2025-08-22)
 
-  @IsOptional()
-  @IsNumberString()
-  valorMensalidade?: string;
-
-  // Se for dependente, o ID do titular é obrigatório
-  @IsOptional()
-  @IsUUID('4', { message: 'O ID do titular deve ser um UUID válido.' })
+  // Regra condicional em conjunto com o validador customizado acima
+  @Validate(TitularDependenteConsistency)
+  @ValidateIf((o) => o.tipo === BeneficiarioTipoDto.DEPENDENTE)
+  @IsUUID('4', { message: 'titularId deve ser um UUID v4 válido.' })
   titularId?: string;
-  
-  // --- ✅ NOVOS CAMPOS ADICIONADOS ---
 
   @IsOptional()
   @IsString()
+  @Transform(({ value }) => trim(value))
   matricula?: string;
 
   @IsOptional()
   @IsString()
+  @Transform(({ value }) => trim(value))
   carteirinha?: string;
 
   @IsOptional()
-  @IsEnum(SexoDto, { message: 'O sexo deve ser M ou F.'})
-  @Length(1, 1)
+  @IsEnum(SexoDto)
   sexo?: SexoDto;
 
   @IsOptional()
@@ -67,9 +93,44 @@ export class CreateBeneficiaryDto {
 
   @IsOptional()
   @IsString()
+  @Transform(({ value }) => trim(value))
   plano?: string;
 
   @IsOptional()
   @IsString()
+  @Transform(({ value }) => trim(value))
   centroCusto?: string;
+
+  /**
+   * Aceita "1234.56" ou "1234,56". Normaliza para ponto.
+   * Se no Prisma você usa Decimal como string, manter assim é ok.
+   */
+  @IsOptional()
+  @Matches(/^\d+([.,]\d{1,2})?$/, {
+    message: 'valorMensalidade deve ser numérico com até 2 casas decimais.',
+  })
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.replace(',', '.').trim() : value
+  )
+  valorMensalidade?: string;
+
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }) => trim(value))
+  faixaEtaria?: string;
+
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }) => trim(value))
+  estado?: string; // se quiser, podemos trocar para enum alinhado ao Prisma (BeneficiarioStatus)
+
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }) => trim(value))
+  contrato?: string;
+
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }) => trim(value))
+  comentario?: string;
 }

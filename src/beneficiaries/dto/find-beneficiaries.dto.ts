@@ -1,38 +1,48 @@
-import { Transform } from 'class-transformer';
-import { IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
-
-// Enum para garantir que o filtro 'tipo' só aceite os valores corretos
-enum BeneficiarioTipoDto {
-  TITULAR = 'TITULAR',
-  DEPENDENTE = 'DEPENDENTE',
-}
-
-// Helper para transformar string em número para validação
-const toInt = ({ value }: { value: unknown }) => {
-  const n = parseInt(String(value), 10);
-  return Number.isNaN(n) ? undefined : n;
-};
+import { IsOptional, IsInt, Min, Max, IsEnum, IsString, IsBoolean } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import { BeneficiarioTipo } from '@prisma/client';
 
 export class FindBeneficiariesQueryDto {
+  /**
+   * Número da página para paginação.
+   * @example 1
+   */
   @IsOptional()
-  @Transform(toInt)
+  @Type(() => Number)
   @IsInt()
   @Min(1)
-  page = 1;
+  page?: number;
 
+  /**
+   * Número de itens por página.
+   * @example 10
+   */
   @IsOptional()
-  @Transform(toInt)
+  @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(500)
-  limit = 10;
+  @Max(1000) // Limite máximo de 1000 para segurança
+  limit?: number;
 
+  /**
+   * Filtra por tipo de beneficiário (TITULAR ou DEPENDENTE).
+   */
+  @IsOptional()
+  @IsEnum(BeneficiarioTipo)
+  tipo?: BeneficiarioTipo;
+
+  /**
+   * Termo de busca livre para nome ou CPF.
+   */
   @IsOptional()
   @IsString()
   search?: string;
 
-  // ✅ CAMPO QUE FALTAVA ADICIONADO AQUI
+  /**
+   * Se 'true', ignora a paginação e retorna todos os registros.
+   */
   @IsOptional()
-  @IsEnum(BeneficiarioTipoDto, { message: 'O tipo deve ser TITULAR ou DEPENDENTE.' })
-  tipo?: BeneficiarioTipoDto;
+  @Transform(({ value }) => value === true || value === 'true')
+  @IsBoolean()
+  all?: boolean;
 }

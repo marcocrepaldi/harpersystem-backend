@@ -14,6 +14,8 @@ import { ClientsModule } from './clients/clients.module';
 import { PoliciesModule } from './policies/policies.module';
 import { ServicesModule } from './services/services.module';
 import { BeneficiariesModule } from './beneficiaries/beneficiaries.module';
+import { InvoicesModule } from './invoices/invoices.module';
+import { ReconciliationModule } from './reconciliation/reconciliation.module';
 
 @Module({
   imports: [
@@ -27,7 +29,9 @@ import { BeneficiariesModule } from './beneficiaries/beneficiaries.module';
     ClientsModule,
     PoliciesModule,
     ServicesModule,
-    BeneficiariesModule
+    BeneficiariesModule,
+    InvoicesModule,
+    ReconciliationModule
   ],
   controllers: [AppController],
   providers: [
