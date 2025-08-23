@@ -1,5 +1,17 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import * as XLSX from 'xlsx';
+
+type ReconTabs = {
+  onlyInInvoice: Array<{ cpf: string; nome: string; valorCobrado: string }>;
+  onlyInRegistry: Array<{ cpf: string; nome: string; valorMensalidade: string }>;
+  mismatched: Array<{
+    cpf: string; nome: string; valorCobrado: string; valorMensalidade: string; diferenca: string;
+  }>;
+  duplicates: Array<{
+    cpf: string; nome: string; ocorrencias: number; somaCobrada: string; valores: string[];
+  }>;
+};
 
 type ReconciliationPayload = {
   ok: boolean;
@@ -14,16 +26,7 @@ type ReconciliationPayload = {
     mismatched: number;
     duplicates: number;
   };
-  tabs: {
-    onlyInInvoice: Array<{ cpf: string; nome: string; valorCobrado: string }>;
-    onlyInRegistry: Array<{ cpf: string; nome: string; valorMensalidade: string }>;
-    mismatched: Array<{
-      cpf: string; nome: string; valorCobrado: string; valorMensalidade: string; diferenca: string;
-    }>;
-    duplicates: Array<{
-      cpf: string; nome: string; ocorrencias: number; somaCobrada: string; valores: string[];
-    }>;
-  };
+  tabs: ReconTabs;
 };
 
 @Injectable()
@@ -38,7 +41,7 @@ export class ReconciliationService {
         id: true,
         nomeCompleto: true,
         cpf: true,
-        valorMensalidade: true, // <-- campo correto no seu schema
+        valorMensalidade: true,
       },
     });
   }
@@ -82,7 +85,7 @@ export class ReconciliationService {
 
     // Helpers
     const clean = (s: string | null | undefined) => (s ?? '').replace(/\D/g, '');
-    const toNumber = (v: any) => Number(v || 0); // Prisma Decimal -> string; convertemos p/ somas simples
+    const toNumber = (v: any) => Number(v || 0);
     const toBRL = (n: number) => n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 
     // Índice por CPF
@@ -92,11 +95,11 @@ export class ReconciliationService {
       if (!cpf) continue;
       mapAtivos.set(cpf, {
         nome: b.nomeCompleto ?? '',
-        mensalidade: toNumber(b.valorMensalidade), // pode ser 0 se null
+        mensalidade: toNumber(b.valorMensalidade),
       });
     }
 
-    // Agrupa fatura por CPF (para somar e achar duplicados)
+    // Fatura por CPF
     const mapFatura = new Map<string, { nome: string; soma: number; valores: number[] }>();
     for (const it of faturaItems) {
       const cpf = clean(it.cpfBeneficiarioOperadora);
@@ -132,7 +135,6 @@ export class ReconciliationService {
           valores: info.valores.map((v) => toBRL(v)),
         });
       }
-      // divergência (tolerância de 1 centavo)
       const diff = Math.abs(info.soma - ativo.mensalidade);
       if (diff > 0.009) {
         mismatched.push({
@@ -156,7 +158,7 @@ export class ReconciliationService {
       }
     }
 
-    // Ordenações
+    // Ordena
     onlyInInvoice.sort((a, b) => a.nome.localeCompare(b.nome));
     onlyInRegistry.sort((a, b) => a.nome.localeCompare(b.nome));
     mismatched.sort((a, b) => a.nome.localeCompare(b.nome));
@@ -176,6 +178,100 @@ export class ReconciliationService {
         duplicates: duplicates.length,
       },
       tabs: { onlyInInvoice, onlyInRegistry, mismatched, duplicates },
+    };
+  }
+
+  // == EXPORT ==
+  async exportReconciliation(
+    clientId: string,
+    opts: {
+      mesReferencia?: Date;
+      format: 'xlsx' | 'csv';
+      tab: 'mismatched' | 'onlyInInvoice' | 'onlyInRegistry' | 'duplicates' | 'all';
+    },
+  ): Promise<{ filename: string; contentType: string; buffer: Buffer }> {
+    const payload = await this.buildReconciliation(clientId, opts.mesReferencia);
+    const yyyymm = payload.mesReferencia.slice(0, 7);
+
+    // Monta datasets em JSON “flat”
+    const sheets = {
+      mismatched: {
+        name: 'Divergentes',
+        rows: payload.tabs.mismatched.map((r) => ({
+          CPF: r.cpf,
+          Beneficiario: r.nome,
+          Valor_Cobrado: r.valorCobrado,
+          Valor_Mensalidade: r.valorMensalidade,
+          Diferenca: r.diferenca,
+        })),
+      },
+      onlyInInvoice: {
+        name: 'So_na_fatura',
+        rows: payload.tabs.onlyInInvoice.map((r) => ({
+          CPF: r.cpf,
+          Beneficiario: r.nome,
+          Valor_Cobrado: r.valorCobrado,
+        })),
+      },
+      onlyInRegistry: {
+        name: 'So_no_cadastro',
+        rows: payload.tabs.onlyInRegistry.map((r) => ({
+          CPF: r.cpf,
+          Beneficiario: r.nome,
+          Valor_Mensalidade: r.valorMensalidade,
+        })),
+      },
+      duplicates: {
+        name: 'Duplicados',
+        rows: payload.tabs.duplicates.map((r) => ({
+          CPF: r.cpf,
+          Beneficiario: r.nome,
+          Ocorrencias: r.ocorrencias,
+          Soma_Cobrada: r.somaCobrada,
+          Valores: r.valores.join(', '),
+        })),
+      },
+    };
+
+    if (opts.format === 'xlsx') {
+      const wb = XLSX.utils.book_new();
+
+      if (opts.tab === 'all') {
+        Object.values(sheets).forEach((s) => {
+          const ws = XLSX.utils.json_to_sheet(s.rows);
+          XLSX.utils.book_append_sheet(wb, ws, s.name);
+        });
+        const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        return {
+          filename: `reconciliacao_${clientId}_${yyyymm}.xlsx`,
+          contentType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          buffer: buf as Buffer,
+        };
+      } else {
+        const s = sheets[opts.tab];
+        const ws = XLSX.utils.json_to_sheet(s.rows);
+        XLSX.utils.book_append_sheet(wb, ws, s.name);
+        const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        return {
+          filename: `reconciliacao_${opts.tab}_${clientId}_${yyyymm}.xlsx`,
+          contentType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          buffer: buf as Buffer,
+        };
+      }
+    }
+
+    // CSV (somente 1 aba)
+    const s = sheets[opts.tab as Exclude<typeof opts.tab, 'all'>];
+    const ws = XLSX.utils.json_to_sheet(s.rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, s.name);
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'csv' });
+    return {
+      filename: `reconciliacao_${opts.tab}_${clientId}_${yyyymm}.csv`,
+      contentType: 'text/csv; charset=utf-8',
+      buffer: buf as Buffer,
     };
   }
 
