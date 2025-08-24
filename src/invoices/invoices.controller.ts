@@ -1,18 +1,17 @@
 import {
+  BadRequestException,
   Controller,
+  Delete,
+  MaxFileSizeValidator,
   Param,
+  ParseFilePipe,
   Post,
+  Query,
   UploadedFile,
   UseInterceptors,
-  ParseFilePipe,
-  MaxFileSizeValidator,
-  Query,
-  BadRequestException,
-  Get,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { InvoicesService } from './invoices.service';
-import { ParseCuidPipe } from '../common/pipes/parse-cuid.pipe';
 
 @Controller('clients/:clientId/invoices')
 export class InvoicesController {
@@ -21,43 +20,34 @@ export class InvoicesController {
   @Post('upload')
   @UseInterceptors(FileInterceptor('file'))
   async uploadInvoice(
-    @Param('clientId', ParseCuidPipe) clientId: string,
+    @Param('clientId') clientId: string,
     @UploadedFile(
       new ParseFilePipe({
-        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })],
+        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })], // apenas tamanho
       }),
     )
     file: Express.Multer.File,
-    @Query('mes') mes?: string, // YYYY-MM
   ) {
-    let mesReferencia: Date | undefined;
-
-    if (mes) {
-      const ok = /^\d{4}-\d{2}$/.test(mes);
-      if (!ok) throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
-      const [y, m] = mes.split('-').map((s) => parseInt(s, 10));
-      mesReferencia = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0, 0));
+    if (!file) {
+      throw new BadRequestException('Nenhum arquivo enviado.');
     }
-
-    return this.invoicesService.processInvoiceUpload(clientId, file, mesReferencia);
+    return this.invoicesService.processInvoiceUpload(clientId, file);
   }
 
-  /**
-   * GET /api/clients/:clientId/invoices?mes=YYYY-MM
-   * Retorna resumo + itens importados do mês (ou mês atual se não enviado).
-   */
-  @Get()
-  async listImported(
-    @Param('clientId', ParseCuidPipe) clientId: string,
+  @Delete()
+  async deleteByMonth(
+    @Param('clientId') clientId: string,
     @Query('mes') mes?: string,
   ) {
-    let mesReferencia: Date | undefined;
-    if (mes) {
-      const ok = /^\d{4}-\d{2}$/.test(mes);
-      if (!ok) throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
-      const [y, m] = mes.split('-').map((s) => parseInt(s, 10));
-      mesReferencia = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0, 0));
+    if (!mes) {
+      throw new BadRequestException('Parâmetro "mes" é obrigatório (YYYY-MM).');
     }
-    return this.invoicesService.getImportedForMonth(clientId, mesReferencia);
+    if (!/^\d{4}-\d{2}$/.test(mes)) {
+      throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
+    }
+
+    const [y, m] = mes.split('-').map(Number);
+    const mesReferencia = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0, 0));
+    return this.invoicesService.deleteInvoiceByMonth(clientId, mesReferencia);
   }
 }

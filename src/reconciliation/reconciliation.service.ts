@@ -5,12 +5,14 @@ import * as XLSX from 'xlsx';
 type ReconTabs = {
   onlyInInvoice: Array<{ cpf: string; nome: string; valorCobrado: string }>;
   onlyInRegistry: Array<{ cpf: string; nome: string; valorMensalidade: string }>;
-  mismatched: Array<{
-    cpf: string; nome: string; valorCobrado: string; valorMensalidade: string; diferenca: string;
-  }>;
-  duplicates: Array<{
-    cpf: string; nome: string; ocorrencias: number; somaCobrada: string; valores: string[];
-  }>;
+  mismatched: Array<{ cpf: string; nome: string; valorCobrado: string; valorMensalidade: string; diferenca: string }>;
+  duplicates: Array<{ cpf: string; nome: string; ocorrencias: number; somaCobrada: string; valores: string[] }>;
+};
+
+type Filters = {
+  tipo?: 'TITULAR' | 'DEPENDENTE';
+  plano?: string;
+  centro?: string;
 };
 
 type ReconciliationPayload = {
@@ -26,6 +28,7 @@ type ReconciliationPayload = {
     mismatched: number;
     duplicates: number;
   };
+  filtersApplied: Filters;
   tabs: ReconTabs;
 };
 
@@ -33,17 +36,28 @@ type ReconciliationPayload = {
 export class ReconciliationService {
   constructor(private readonly prisma: PrismaService) {}
 
-  // Beneficiários ATIVOS = status ATIVO e sem dataSaida
-  private async fetchBeneficiariosAtivos(clientId: string) {
-    return this.prisma.beneficiario.findMany({
-      where: { clientId, status: 'ATIVO', dataSaida: null },
-      select: {
-        id: true,
-        nomeCompleto: true,
-        cpf: true,
-        valorMensalidade: true,
-      },
-    });
+  // Opções para filtros (distintos do cadastro ativo do cliente; sem mês)
+  async getFilterOptions(clientId: string) {
+    const [planos, centros] = await Promise.all([
+      this.prisma.beneficiario.findMany({
+        where: { clientId, status: 'ATIVO', dataSaida: null },
+        distinct: ['plano'],
+        select: { plano: true },
+        orderBy: { plano: 'asc' },
+      }),
+      this.prisma.beneficiario.findMany({
+        where: { clientId, status: 'ATIVO', dataSaida: null },
+        distinct: ['centroCusto'],
+        select: { centroCusto: true },
+        orderBy: { centroCusto: 'asc' },
+      }),
+    ]);
+
+    return {
+      tipos: ['TITULAR', 'DEPENDENTE'] as const,
+      planos: planos.map(p => p.plano).filter(Boolean) as string[],
+      centros: centros.map(c => c.centroCusto).filter(Boolean) as string[],
+    };
   }
 
   private currentMonthUTC(): Date {
@@ -56,14 +70,26 @@ export class ReconciliationService {
     return `${y}-${m}-01`;
   }
 
-  async buildReconciliation(clientId: string, mesReferenciaInput?: Date): Promise<ReconciliationPayload> {
+  private makeBenefWhere(clientId: string, filters?: Filters) {
+    const where: any = { clientId, status: 'ATIVO', dataSaida: null };
+    if (filters?.tipo) where.tipo = filters.tipo; // TITULAR|DEPENDENTE
+    if (filters?.plano) where.plano = filters.plano; // equals (exato) — pode trocar para contains se quiser
+    if (filters?.centro) where.centroCusto = filters.centro;
+    return where;
+  }
+
+  async buildReconciliation(
+    clientId: string,
+    opts?: { mesReferencia?: Date; filters?: Filters },
+  ): Promise<ReconciliationPayload> {
     const client = await this.prisma.client.findUnique({ where: { id: clientId }, select: { id: true } });
     if (!client) throw new NotFoundException('Cliente não encontrado.');
 
-    const mesReferencia = mesReferenciaInput ?? this.currentMonthUTC();
+    const mesReferencia = opts?.mesReferencia ?? this.currentMonthUTC();
     const mesStr = this.formatYYYYMM01(mesReferencia);
+    const filters = opts?.filters ?? {};
 
-    // 1) Fatura importada do mês
+    // 1) Fatura importada do mês (não tem plano/centro, filtraremos apenas pelo lado do cadastro)
     const [faturaItems, faturaCount, faturaAgg] = await this.prisma.$transaction([
       this.prisma.faturaImportada.findMany({
         where: { clientId, mesReferencia },
@@ -80,26 +106,26 @@ export class ReconciliationService {
       }),
     ]);
 
-    // 2) Beneficiários ativos
-    const ativos = await this.fetchBeneficiariosAtivos(clientId);
+    // 2) Beneficiários ATIVOS filtrados
+    const ativos = await this.prisma.beneficiario.findMany({
+      where: this.makeBenefWhere(clientId, filters),
+      select: { id: true, nomeCompleto: true, cpf: true, valorMensalidade: true },
+    });
 
     // Helpers
     const clean = (s: string | null | undefined) => (s ?? '').replace(/\D/g, '');
     const toNumber = (v: any) => Number(v || 0);
     const toBRL = (n: number) => n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 
-    // Índice por CPF
+    // Índice por CPF (apenas dos ativos filtrados!)
     const mapAtivos = new Map<string, { nome: string; mensalidade: number }>();
     for (const b of ativos) {
       const cpf = clean(b.cpf);
       if (!cpf) continue;
-      mapAtivos.set(cpf, {
-        nome: b.nomeCompleto ?? '',
-        mensalidade: toNumber(b.valorMensalidade),
-      });
+      mapAtivos.set(cpf, { nome: b.nomeCompleto ?? '', mensalidade: toNumber(b.valorMensalidade) });
     }
 
-    // Fatura por CPF
+    // Agrupa fatura por CPF
     const mapFatura = new Map<string, { nome: string; soma: number; valores: number[] }>();
     for (const it of faturaItems) {
       const cpf = clean(it.cpfBeneficiarioOperadora);
@@ -119,11 +145,19 @@ export class ReconciliationService {
     const mismatched: Array<{ cpf: string; nome: string; valorCobrado: string; valorMensalidade: string; diferenca: string }> = [];
     const duplicates: Array<{ cpf: string; nome: string; ocorrencias: number; somaCobrada: string; valores: string[] }> = [];
 
-    // Só na fatura / duplicados / divergentes
+    // Regras: filtros se aplicam ao CADASTRO. Portanto:
+    // - mismatched/duplicates: só aparecem se houver cadastro correspondente no conjunto filtrado;
+    // - onlyInRegistry: são os cadastros filtrados que não aparecem na fatura;
+    // - onlyInInvoice: como não há cadastro filtrado correspondente, NÃO entram quando há filtro (só aparecem sem filtros ou se o CPF estiver no cadastro filtrado).
     for (const [cpf, info] of mapFatura.entries()) {
       const ativo = mapAtivos.get(cpf);
       if (!ativo) {
-        onlyInInvoice.push({ cpf: this.maskCpf(cpf), nome: info.nome || '—', valorCobrado: toBRL(info.soma) });
+        // só incluímos "só na fatura" quando não há filtros aplicados,
+        // ou quando existir cadastro correspondente (o que não é o caso deste branch).
+        const anyFilter = !!(filters.tipo || filters.plano || filters.centro);
+        if (!anyFilter) {
+          onlyInInvoice.push({ cpf: this.maskCpf(cpf), nome: info.nome || '—', valorCobrado: toBRL(info.soma) });
+        }
         continue;
       }
       if (info.valores.length > 1) {
@@ -147,7 +181,7 @@ export class ReconciliationService {
       }
     }
 
-    // Só no cadastro
+    // Só no cadastro (filtrado)
     for (const [cpf, ativo] of mapAtivos.entries()) {
       if (!mapFatura.has(cpf)) {
         onlyInRegistry.push({
@@ -177,6 +211,7 @@ export class ReconciliationService {
         mismatched: mismatched.length,
         duplicates: duplicates.length,
       },
+      filtersApplied: filters,
       tabs: { onlyInInvoice, onlyInRegistry, mismatched, duplicates },
     };
   }
@@ -188,54 +223,54 @@ export class ReconciliationService {
       mesReferencia?: Date;
       format: 'xlsx' | 'csv';
       tab: 'mismatched' | 'onlyInInvoice' | 'onlyInRegistry' | 'duplicates' | 'all';
+      filters?: Filters;
     },
   ): Promise<{ filename: string; contentType: string; buffer: Buffer }> {
-    const payload = await this.buildReconciliation(clientId, opts.mesReferencia);
+    const payload = await this.buildReconciliation(clientId, {
+      mesReferencia: opts.mesReferencia,
+      filters: opts.filters,
+    });
     const yyyymm = payload.mesReferencia.slice(0, 7);
 
-    // Monta datasets em JSON “flat”
+    const sheetNameSuffix = () => {
+      const parts: string[] = [];
+      if (opts.filters?.tipo) parts.push(`tipo_${opts.filters.tipo}`);
+      if (opts.filters?.plano) parts.push(`plano_${opts.filters.plano}`);
+      if (opts.filters?.centro) parts.push(`centro_${opts.filters.centro}`);
+      return parts.length ? `_${parts.join('-')}` : '';
+    };
+
+    // Monta datasets
     const sheets = {
       mismatched: {
         name: 'Divergentes',
         rows: payload.tabs.mismatched.map((r) => ({
-          CPF: r.cpf,
-          Beneficiario: r.nome,
-          Valor_Cobrado: r.valorCobrado,
-          Valor_Mensalidade: r.valorMensalidade,
-          Diferenca: r.diferenca,
+          CPF: r.cpf, Beneficiario: r.nome,
+          Valor_Cobrado: r.valorCobrado, Valor_Mensalidade: r.valorMensalidade, Diferenca: r.diferenca,
         })),
       },
       onlyInInvoice: {
         name: 'So_na_fatura',
         rows: payload.tabs.onlyInInvoice.map((r) => ({
-          CPF: r.cpf,
-          Beneficiario: r.nome,
-          Valor_Cobrado: r.valorCobrado,
+          CPF: r.cpf, Beneficiario: r.nome, Valor_Cobrado: r.valorCobrado,
         })),
       },
       onlyInRegistry: {
         name: 'So_no_cadastro',
         rows: payload.tabs.onlyInRegistry.map((r) => ({
-          CPF: r.cpf,
-          Beneficiario: r.nome,
-          Valor_Mensalidade: r.valorMensalidade,
+          CPF: r.cpf, Beneficiario: r.nome, Valor_Mensalidade: r.valorMensalidade,
         })),
       },
       duplicates: {
         name: 'Duplicados',
         rows: payload.tabs.duplicates.map((r) => ({
-          CPF: r.cpf,
-          Beneficiario: r.nome,
-          Ocorrencias: r.ocorrencias,
-          Soma_Cobrada: r.somaCobrada,
-          Valores: r.valores.join(', '),
+          CPF: r.cpf, Beneficiario: r.nome, Ocorrencias: r.ocorrencias, Soma_Cobrada: r.somaCobrada, Valores: r.valores.join(', '),
         })),
       },
     };
 
     if (opts.format === 'xlsx') {
       const wb = XLSX.utils.book_new();
-
       if (opts.tab === 'all') {
         Object.values(sheets).forEach((s) => {
           const ws = XLSX.utils.json_to_sheet(s.rows);
@@ -243,9 +278,8 @@ export class ReconciliationService {
         });
         const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
         return {
-          filename: `reconciliacao_${clientId}_${yyyymm}.xlsx`,
-          contentType:
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          filename: `reconciliacao_${clientId}_${yyyymm}${sheetNameSuffix()}.xlsx`,
+          contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           buffer: buf as Buffer,
         };
       } else {
@@ -254,22 +288,21 @@ export class ReconciliationService {
         XLSX.utils.book_append_sheet(wb, ws, s.name);
         const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
         return {
-          filename: `reconciliacao_${opts.tab}_${clientId}_${yyyymm}.xlsx`,
-          contentType:
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          filename: `reconciliacao_${opts.tab}_${clientId}_${yyyymm}${sheetNameSuffix()}.xlsx`,
+          contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           buffer: buf as Buffer,
         };
       }
     }
 
-    // CSV (somente 1 aba)
+    // CSV
     const s = sheets[opts.tab as Exclude<typeof opts.tab, 'all'>];
     const ws = XLSX.utils.json_to_sheet(s.rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, s.name);
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'csv' });
     return {
-      filename: `reconciliacao_${opts.tab}_${clientId}_${yyyymm}.csv`,
+      filename: `reconciliacao_${opts.tab}_${clientId}_${yyyymm}${sheetNameSuffix()}.csv`,
       contentType: 'text/csv; charset=utf-8',
       buffer: buf as Buffer,
     };
