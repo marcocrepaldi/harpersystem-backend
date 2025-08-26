@@ -12,7 +12,6 @@ export class PrismaService
   implements OnModuleInit, OnModuleDestroy
 {
   constructor() {
-    // Habilita logs em desenvolvimento
     super({
       log:
         process.env.NODE_ENV === 'development'
@@ -33,7 +32,6 @@ export class PrismaService
    * Fecha a conexão do Prisma quando a aplicação for encerrada
    */
   async enableShutdownHooks(app: INestApplication) {
-    // Força o TypeScript a aceitar o evento beforeExit
     (this as any).$on('beforeExit', async () => {
       await app.close();
     });

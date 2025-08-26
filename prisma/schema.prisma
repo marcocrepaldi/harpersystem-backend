@@ -37,12 +37,26 @@ enum ClientStatus {
 // Health
 enum BeneficiarioTipo {
   TITULAR
-  DEPENDENTE
+  FILHO
+  CONJUGE
 }
 
 enum BeneficiarioStatus {
   ATIVO
   INATIVO
+}
+
+// 👇 NOVOS: para regras/pró-rata e movimentos
+enum RegimeCobranca {
+  MENSAL
+  DIARIO
+}
+
+enum MotivoMovimento {
+  INCLUSAO
+  EXCLUSAO
+  ALTERACAO
+  NENHUM
 }
 
 // ---------- CORE ----------
@@ -206,6 +220,9 @@ model RegraCobranca {
   cliente           Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
   descricao         String
   dataCorteCobranca Int
+  // 👇 política avançada (pró-rata, corte, tolerância, etc.)
+  policy            Json?
+
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
@@ -223,13 +240,13 @@ model Beneficiario {
   titular     Beneficiario?  @relation("TitularDependentes", fields: [titularId], references: [id], onDelete: SetNull)
   dependentes Beneficiario[] @relation("TitularDependentes")
 
-  // --- Campos do Arquivo ---
+  // --- Campos do Arquivo / Layout completo ---
   nomeCompleto     String
   cpf              String?            @db.VarChar(14)
   tipo             BeneficiarioTipo
   dataEntrada      DateTime           // VIGENCIA
   dataSaida        DateTime?
-  valorMensalidade Decimal?           @db.Decimal(10, 2)
+  valorMensalidade Decimal?           @db.Decimal(12, 2) // ↑ precisão p/ contratos maiores
   status           BeneficiarioStatus @default(ATIVO)
   matricula        String?
   carteirinha      String?
@@ -242,6 +259,11 @@ model Beneficiario {
   contrato         String?
   comentario       String?            // AÇÃO virou comentário
 
+  // 👇 Novos opcionais (regras / auditoria de movimentos)
+  regimeCobranca   RegimeCobranca?
+  motivoMovimento  MotivoMovimento?
+  observacoes      String?
+
   regraCobrancaId String?
   regraCobranca   RegraCobranca? @relation(fields: [regraCobrancaId], references: [id], onDelete: SetNull)
 
@@ -250,6 +272,11 @@ model Beneficiario {
 
   @@unique([clientId, cpf])
   @@index([clientId, matricula])
+  @@index([clientId, carteirinha])
+  @@index([clientId, contrato])
+  @@index([clientId, plano])
+  @@index([clientId, centroCusto])
+  @@index([clientId, dataEntrada])
   @@map("health_beneficiaries")
 }
 
@@ -261,15 +288,56 @@ model FaturaImportada {
   mesReferencia             DateTime
   nomeBeneficiarioOperadora String?
   cpfBeneficiarioOperadora  String?  @db.VarChar(14)
-  valorCobradoOperadora     Decimal? @db.Decimal(10, 2)
+  valorCobradoOperadora     Decimal? @db.Decimal(12, 2) // ↑ precisão
   statusConciliacao         String?
 
   raw       Json?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // 👇 Itens detalhados da fatura (espelho do layout)
+  itens FaturaItem[]
+
   @@index([clientId, mesReferencia])
   @@map("health_imported_invoices")
+}
+
+model FaturaItem {
+  id       String @id @default(cuid())
+  faturaId String
+  fatura   FaturaImportada @relation(fields: [faturaId], references: [id], onDelete: Cascade)
+
+  // --- Espelho do layout da linha de fatura ---
+  contrato         String?
+  carteirinha      String?
+  nomeCompleto     String?
+  centroCusto      String?
+  sexo             String?
+  tipo             String?     // "TITULAR" | "DEPENDENTE" em texto
+  estado           String?
+  cpf              String?     @db.VarChar(14)
+  dataNascimento   DateTime?
+  faixaEtaria      String?
+  dataEntrada      DateTime?   // início vigência informado na fatura
+  dataSaida        DateTime?
+  plano            String?
+  valorPlano       Decimal?    @db.Decimal(12, 2) // = Cobrado
+  statusLinha      String?
+
+  // (opcionais — granularidade por item, se necessário)
+  regimeCobranca   RegimeCobranca?
+  motivoMovimento  MotivoMovimento?
+  observacoes      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([faturaId])
+  @@index([cpf])
+  @@index([carteirinha])
+  @@index([contrato])
+  @@index([plano])
+  @@map("health_imported_invoice_items")
 }
 
 // ---------- NORMALIZAÇÃO ----------
@@ -383,4 +451,3 @@ model AuditLog {
   @@index([corretorId, entity, entityId, at])
   @@map("audit_log")
 }
-
