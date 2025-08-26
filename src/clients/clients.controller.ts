@@ -1,8 +1,10 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
   Get,
+  NotFoundException,
   Param,
   Patch,
   Post,
@@ -20,6 +22,7 @@ import { CreateContactDto, UpdateContactDto } from './dto/contact.dto';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
 import { FindClientsQueryDto } from './dto/find-clients.dto';
+import { PrismaService } from '../prisma/prisma.service';
 
 type RequestUser = {
   id: string;
@@ -42,14 +45,20 @@ function parseIncludeRels(value?: string): boolean | IncludeKey[] | false | unde
   const v = (value || '').trim().toLowerCase();
   if (v === 'true' || v === 'all' || v === '*') return true;
   if (v === 'false' || v === '') return false;
-  const parts = v.split(',').map((s) => s.trim()).filter(Boolean) as IncludeKey[];
+  const parts = v
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean) as IncludeKey[];
   return parts.length ? parts : false;
 }
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('clients')
 export class ClientsController {
-  constructor(private readonly service: ClientsService) {}
+  constructor(
+    private readonly service: ClientsService,
+    private readonly prisma: PrismaService, // <- adicionado
+  ) {}
 
   @Get()
   findMany(@Query() query: FindClientsQueryDto, @CurrentUser() user: RequestUser) {
@@ -172,5 +181,107 @@ export class ClientsController {
     @Req() req: Request,
   ) {
     return this.service.deleteContact(clientId, contactId, user.corretorId, user.id, req);
+  }
+
+  // =====================================================================
+  // =====================  Invoices / Reconciliação  =====================
+  // =====================================================================
+
+  /**
+   * PATCH /clients/:clientId/invoices/reconcile
+   * Marca como CONCILIADO:
+   *  - itens (health_imported_invoice_items.statusLinha)
+   *  - cabeçalhos (health_imported_invoices.statusConciliacao), para fallback sem itens
+   *
+   * Body: { invoiceIds: string[] }
+   * Retorno: { ok, updatedItems, updatedInvoices, count }
+   */
+  @Patch(':clientId/invoices/reconcile')
+  async reconcileInvoices(
+    @Param('clientId') clientId: string,
+    @Body() body: { invoiceIds: string[] },
+    @CurrentUser() user: RequestUser,
+  ) {
+    const ids = Array.isArray(body?.invoiceIds) ? body.invoiceIds.filter(Boolean) : [];
+    if (ids.length === 0) {
+      throw new BadRequestException('Informe ao menos um ID de fatura/linha para conciliar.');
+    }
+
+    // valida escopo do tenant
+    const client = await this.prisma.client.findFirst({
+      where: { id: clientId, corretorId: user.corretorId },
+      select: { id: true },
+    });
+    if (!client) {
+      throw new NotFoundException('Cliente não encontrado neste tenant.');
+    }
+
+    // Itens pertencentes ao cliente (JOIN via fatura)
+    const items = await this.prisma.faturaItem.updateMany({
+      data: { statusLinha: 'CONCILIADO', updatedAt: new Date() },
+      where: {
+        id: { in: ids },
+        fatura: { clientId },
+      },
+    });
+
+    // Cabeçalhos pertencentes ao cliente (caso de import sem itens)
+    const headers = await this.prisma.faturaImportada.updateMany({
+      data: { statusConciliacao: 'CONCILIADO', updatedAt: new Date() },
+      where: {
+        id: { in: ids },
+        clientId,
+      },
+    });
+
+    return {
+      ok: true,
+      updatedItems: items.count,
+      updatedInvoices: headers.count,
+      count: items.count + headers.count,
+    };
+  }
+
+  /**
+   * DELETE /clients/:clientId/invoices?mes=YYYY-MM
+   * Remove a fatura importada do mês (cabeçalhos + itens em cascata).
+   *
+   * Retorno: { ok, count }
+   */
+  @Delete(':clientId/invoices')
+  async deleteInvoicesByMonth(
+    @Param('clientId') clientId: string,
+    @Query('mes') mes: string,
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (!mes || !/^\d{4}-\d{2}$/.test(mes)) {
+      throw new BadRequestException('Parâmetro "mes" inválido. Use o formato YYYY-MM.');
+    }
+
+    // valida escopo do tenant
+    const client = await this.prisma.client.findFirst({
+      where: { id: clientId, corretorId: user.corretorId },
+      select: { id: true },
+    });
+    if (!client) {
+      throw new NotFoundException('Cliente não encontrado neste tenant.');
+    }
+
+    const year = Number(mes.slice(0, 4));
+    const month = Number(mes.slice(5, 7));
+    const firstDay = new Date(Date.UTC(year, month - 1, 1));
+    const nextMonth = new Date(Date.UTC(year, month, 1));
+
+    const result = await this.prisma.faturaImportada.deleteMany({
+      where: {
+        clientId,
+        mesReferencia: {
+          gte: firstDay,
+          lt: nextMonth,
+        },
+      },
+    });
+
+    return { ok: true, count: result.count };
   }
 }

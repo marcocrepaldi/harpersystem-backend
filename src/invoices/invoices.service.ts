@@ -1,16 +1,23 @@
 import {
   Injectable,
   BadRequestException,
-  NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import * as Papa from 'papaparse';
 import * as xlsx from 'xlsx';
 import {
   listImportedInvoicesDTO,
-  reconcileInvoicesDTO,
 } from './dto/invoices.dto';
 
+/**
+ * Serviço de importação/consulta de faturas.
+ * - Lê CSV/XLS/XLSX
+ * - Normaliza cabeçalhos (sem acento/espacos)
+ * - Converte valores monetários de forma resiliente
+ * - (NOVO) Filtra por coluna "credencial" mantendo apenas linhas cujo prefixo (5 chars) é "0TATM"
+ *   -> permite separar Saúde (0TATM) de Dental (ex.: 0TAYS)
+ * - Grava em "health_imported_invoices" (tabela FaturaImportada), modelo de 1 linha por beneficiário
+ */
 @Injectable()
 export class InvoicesService {
   constructor(private readonly prisma: PrismaService) {}
@@ -18,6 +25,7 @@ export class InvoicesService {
   /* ----------------------------- helpers ---------------------------------- */
 
   private decodeSmart(buf: Buffer): { text: string; encoding: 'utf-8' | 'latin1' } {
+    // tenta UTF-8; se houver muitos caracteres de substituição (�), volta para latin1
     const utf8 = buf.toString('utf-8');
     const repl = (utf8.match(/\uFFFD/g) || []).length;
     if (repl <= 2) return { text: utf8, encoding: 'utf-8' };
@@ -36,6 +44,14 @@ export class InvoicesService {
       .replace(/[\s._-]+/g, '');
   }
 
+  /**
+   * Converte valores monetários em BR para número.
+   * Aceita:
+   *  - "R$ 29.781,00" -> 29781
+   *  - "29781"        -> 297.81 (interpreta como centavos)
+   *  - "29,781.00"    -> 29781
+   *  - "(123,45)"     -> -123.45
+   */
   private toNumberSmart(raw: any): number {
     if (raw == null) return NaN;
     if (typeof raw === 'number') return raw;
@@ -48,19 +64,21 @@ export class InvoicesService {
     const negative = /^\(.*\)$/.test(s);
     if (negative) s = s.slice(1, -1);
 
+    // só dígitos -> assume centavos quando >= 3 dígitos
     if (/^\d+$/.test(s)) {
       const n = Number(s);
       const val = s.length >= 3 ? n / 100 : n;
       return negative ? -val : val;
     }
 
+    // heurística de separadores
     if (s.includes(',') && s.includes('.')) {
       const lastComma = s.lastIndexOf(',');
       const lastDot = s.lastIndexOf('.');
       if (lastComma > lastDot) {
-        s = s.replace(/\./g, '').replace(',', '.');
+        s = s.replace(/\./g, '').replace(',', '.'); // BR
       } else {
-        s = s.replace(/,/g, '');
+        s = s.replace(/,/g, ''); // US
       }
     } else {
       if (/,/.test(s)) s = s.replace(/\./g, '').replace(',', '.');
@@ -113,8 +131,20 @@ export class InvoicesService {
     return (counts[0]?.[0] as ',' | ';' | '\t') ?? ';';
   }
 
+  private cleanCPF(v: string | null | undefined) {
+    return (v || '').replace(/\D/g, '').slice(0, 11);
+  }
+
+  private toBRL(n: number) {
+    return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+  }
+
   /* ------------------------------- main ------------------------------------ */
 
+  /**
+   * Importa arquivo e grava em FaturaImportada (1 linha/beneficiário).
+   * (NOVO) Filtra por credencial começando com 0TATM (5 primeiros caracteres).
+   */
   async processInvoiceUpload(clientId: string, file: Express.Multer.File) {
     if (!file) throw new BadRequestException('Nenhum arquivo enviado.');
 
@@ -134,6 +164,7 @@ export class InvoicesService {
       (mime === 'application/vnd.ms-excel' &&
         (name.endsWith('.xls') || name.endsWith('.xlsx')));
 
+    // aliases normalizados
     const NAME_ALIASES = [
       'beneficiario',
       'beneficiário',
@@ -177,6 +208,13 @@ export class InvoicesService {
       'cobrado',
     ].map((k) => this.normalizeKey(k));
 
+    const CREDENCIAL_ALIASES = [
+      'credencial',
+      'cdcredencial',
+      'cred',
+      'carteirinha', // alguns layouts usam o mesmo campo; mantemos por segurança
+    ].map((k) => this.normalizeKey(k));
+
     const pick = (obj: Record<string, any>, aliases: string[]) => {
       for (const a of aliases) {
         if (obj[a] !== undefined && obj[a] !== null && String(obj[a]).trim() !== '') {
@@ -186,6 +224,7 @@ export class InvoicesService {
       return undefined;
     };
 
+    // leitura
     let rows: any[] = [];
 
     try {
@@ -210,19 +249,13 @@ export class InvoicesService {
 
         rows = (parsed.data as any[]).filter((r) => r && Object.keys(r).length);
 
-        console.log(
-          '[Invoices] CSV',
-          { encoding, headerIndex, delimiter, count: rows.length },
-        );
+        console.log('[Invoices] CSV', { encoding, headerIndex, delimiter, count: rows.length });
         console.log('[Invoices] headers(raw):', Object.keys(rows[0] || {}));
       } else if (isExcel) {
         const wb = xlsx.read(file.buffer, { type: 'buffer' });
         const sheet = wb.Sheets[wb.SheetNames[0]];
         rows = xlsx.utils.sheet_to_json(sheet ?? {}, { defval: '' });
-        console.log(
-          '[Invoices] XLS/XLSX',
-          { sheet: wb.SheetNames[0], count: rows.length },
-        );
+        console.log('[Invoices] XLS/XLSX', { sheet: wb.SheetNames[0], count: rows.length });
         console.log('[Invoices] headers(raw):', Object.keys(rows[0] || {}));
       } else {
         throw new BadRequestException(
@@ -236,6 +269,7 @@ export class InvoicesService {
       );
     }
 
+    // normaliza chaves
     const normalized = rows.map((r) => {
       const out: Record<string, any> = {};
       for (const [k, v] of Object.entries(r)) out[this.normalizeKey(k)] = v;
@@ -245,24 +279,39 @@ export class InvoicesService {
     const normFirst = normalized[0] || {};
     console.log('[Invoices] headers(normalized):', Object.keys(normFirst));
 
-    const now = new Date();
-    const mesReferencia = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0),
-    );
+    // (NOVO) filtro por credencial prefixada
+    const REQUIRED_PREFIX = (process.env.INVOICE_CREDENTIAL_PREFIX || '0TATM').toUpperCase();
+    const kept = normalized.filter((rec) => {
+      const cred = pick(rec, CREDENCIAL_ALIASES);
+      if (!cred) return true; // se não houver coluna, não filtramos
+      const prefix = String(cred).toUpperCase().slice(0, 5);
+      return prefix === REQUIRED_PREFIX;
+    });
 
+    const dropped = normalized.length - kept.length;
+    if (dropped > 0) {
+      console.log(`[Invoices] Filtradas por credencial=${REQUIRED_PREFIX}: mantidas=${kept.length}, descartadas=${dropped}`);
+    }
+
+    // mês de referência = 1º dia UTC do mês atual (ajuste se precisar ler do arquivo)
+    const now = new Date();
+    const mesReferencia = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+
+    // gravação
     let processedCount = 0;
 
     await this.prisma.$transaction(async (tx) => {
+      // sobrescreve importações do mesmo mês/cliente
       await tx.faturaImportada.deleteMany({ where: { clientId, mesReferencia } });
 
-      for (const rec of normalized) {
+      for (const rec of kept) {
         const nome = pick(rec, NAME_ALIASES);
         const cpfRaw = pick(rec, CPF_ALIASES);
         const valorRaw = pick(rec, VALOR_ALIASES);
 
         if (!cpfRaw) continue;
 
-        const cpf = String(cpfRaw).replace(/\D/g, '');
+        const cpf = this.cleanCPF(String(cpfRaw));
         if (cpf.length !== 11) continue;
 
         const valor =
@@ -276,12 +325,12 @@ export class InvoicesService {
             mesReferencia,
             nomeBeneficiarioOperadora: (nome ?? '').toString() || null,
             cpfBeneficiarioOperadora: cpf,
-            valorCobradoOperadora:
-              valor === null || Number.isNaN(valor) ? null : valor,
+            valorCobradoOperadora: valor === null || Number.isNaN(valor) ? null : valor,
             statusConciliacao: 'pendente',
-            raw: rec,
+            raw: rec, // mantemos linha crua para auditoria
           },
         });
+
         processedCount++;
       }
     });
@@ -293,10 +342,13 @@ export class InvoicesService {
       message: 'Fatura importada com sucesso.',
       processedRows: processedCount,
       totalRows: rows.length,
+      filteredOutByCredential: dropped,
+      credentialPrefix: REQUIRED_PREFIX,
       detectedColumns: {
         nome: detect(NAME_ALIASES),
         cpf: detect(CPF_ALIASES),
         valor: detect(VALOR_ALIASES),
+        credencial: detect(CREDENCIAL_ALIASES),
       },
       mesReferencia: `${mesReferencia.getUTCFullYear()}-${String(
         mesReferencia.getUTCMonth() + 1,
@@ -304,54 +356,56 @@ export class InvoicesService {
     };
   }
 
+  /**
+   * Lista faturas importadas do mês, com paginação e (opcional) busca simples.
+   */
   async listImported(
     clientId: string,
     { mes, page = 1, limit = 100, search }: listImportedInvoicesDTO,
   ) {
     const today = new Date();
-    let mesToFilter = mes;
+    const ym = mes || `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, '0')}`;
 
-    if (!mesToFilter) {
-      mesToFilter = `${today.getUTCFullYear()}-${String(
-        today.getUTCMonth() + 1,
-      ).padStart(2, '0')}`;
-    }
-
-    const [year, month] = mesToFilter.split('-').map(Number);
+    const [year, month] = ym.split('-').map(Number);
     const startDate = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
     const endDate = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
 
-    const totalCount = await this.prisma.faturaImportada.count({
-      where: {
-        clientId,
-        mesReferencia: {
-          gte: startDate,
-          lt: endDate,
-        },
-      },
-    });
+    const whereBase = {
+      clientId,
+      mesReferencia: { gte: startDate, lt: endDate },
+      ...(search
+        ? {
+            OR: [
+              { nomeBeneficiarioOperadora: { contains: search, mode: 'insensitive' as const } },
+              { cpfBeneficiarioOperadora: { contains: search.replace(/\D/g, '') } },
+            ],
+          }
+        : {}),
+    };
 
-    const faturas = await this.prisma.faturaImportada.findMany({
-      where: {
-        clientId,
-        mesReferencia: {
-          gte: startDate,
-          lt: endDate,
-        },
-      },
-      take: limit,
-      skip: (page - 1) * limit,
-    });
+    const [totalCount, faturas] = await Promise.all([
+      this.prisma.faturaImportada.count({ where: whereBase }),
+      this.prisma.faturaImportada.findMany({
+        where: whereBase,
+        take: limit,
+        skip: (page - 1) * limit,
+        orderBy: [{ createdAt: 'asc' }],
+      }),
+    ]);
 
     return {
       totalCount,
       page,
       limit,
       data: faturas,
-      hasMore: faturas.length === limit,
+      hasMore: (page * limit) < totalCount,
+      mes: ym,
     };
   }
 
+  /**
+   * Remove todas as importações do mês/cliente.
+   */
   async deleteInvoiceByMonth(clientId: string, mesReferencia: Date) {
     const { count } = await this.prisma.faturaImportada.deleteMany({
       where: { clientId, mesReferencia },
@@ -361,24 +415,23 @@ export class InvoicesService {
       deletedCount: count,
     };
   }
-  
-  // ✅ NOVO: Método de conciliação que estava faltando
+
+  /**
+   * Marca um conjunto de linhas como conciliadas (usado pelo botão "Marcar como Conciliado").
+   */
   async reconcileByIds(clientId: string, invoiceIds: string[]) {
-    // Aqui você pode adicionar a lógica de conciliação.
-    // Por exemplo, você pode buscar as faturas por ID e atualizar o status.
-    const reconciled = await this.prisma.faturaImportada.updateMany({
-      where: {
-        id: { in: invoiceIds },
-        clientId,
-      },
-      data: {
-        statusConciliacao: 'conciliada',
-      },
+    if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+      throw new BadRequestException('Informe pelo menos 1 ID de fatura para conciliar.');
+    }
+
+    const result = await this.prisma.faturaImportada.updateMany({
+      where: { id: { in: invoiceIds }, clientId },
+      data: { statusConciliacao: 'conciliada' },
     });
 
     return {
-      message: `${reconciled.count} faturas foram conciliadas com sucesso.`,
-      reconciledCount: reconciled.count,
+      message: `${result.count} faturas foram conciliadas com sucesso.`,
+      reconciledCount: result.count,
     };
   }
 }

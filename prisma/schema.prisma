@@ -324,6 +324,9 @@ model FaturaItem {
   valorPlano       Decimal?    @db.Decimal(12, 2) // = Cobrado
   statusLinha      String?
 
+  // 👇 NOVO: credencial da operadora para filtrar Saúde/Dental
+  credencial       String?     @db.VarChar(32)
+
   // (opcionais — granularidade por item, se necessário)
   regimeCobranca   RegimeCobranca?
   motivoMovimento  MotivoMovimento?
@@ -337,6 +340,7 @@ model FaturaItem {
   @@index([carteirinha])
   @@index([contrato])
   @@index([plano])
+  @@index([credencial]) // 👈 índice para filtro por prefixo
   @@map("health_imported_invoice_items")
 }
 

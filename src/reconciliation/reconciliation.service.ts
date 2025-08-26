@@ -3,14 +3,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '@prisma/client';
 import * as XLSX from 'xlsx';
 
-// ---------- Tipos ----------
+// ---------- tipos ----------
 type ReconTabs = {
   onlyInInvoice: Array<{ id: string; cpf: string; nome: string; valorCobrado: string }>;
   onlyInRegistry: Array<{ id: string; cpf: string; nome: string; valorMensalidade: string }>;
   mismatched: Array<{ id: string; cpf: string; nome: string; valorCobrado: string; valorMensalidade: string; diferenca: string }>;
   duplicates: Array<{ id: string; cpf: string; nome: string; ocorrencias: number; somaCobrada: string; valores: string[] }>;
-  /** NOVO: itens OK (convergentes) */
-  matched: Array<{ id: string; cpf: string; nome: string; valorCobrado: string; valorMensalidade: string; diferenca: string; status: 'OK' }>;
   allInvoice: Array<{
     id: string;
     cpf: string;
@@ -33,15 +31,19 @@ type ReconciliationPayload = {
   clientId: string;
   mesReferencia: string; // YYYY-MM-01
   totals: {
+    // contagens
     faturaCount: number;
-    faturaSum: string;
     ativosCount: number;
     onlyInInvoice: number;
     onlyInRegistry: number;
     mismatched: number;
     duplicates: number;
-    /** NOVO: total de convergentes */
-    matched: number;
+    okCount: number;
+
+    // financeiros (formatados em BRL)
+    faturaSum: string;         // soma de tudo que veio na fatura
+    okSum: string;             // soma das linhas OK (convergentes)
+    onlyInInvoiceSum: string;  // soma do que está "só na fatura"
   };
   filtersApplied: Filters;
   tabs: ReconTabs;
@@ -58,17 +60,17 @@ type FaturaRow = {
 export class ReconciliationService {
   constructor(private readonly prisma: PrismaService) {}
 
-  // ---------- Helpers de data/num ----------
-  private ensureYYYYMM(mes?: string): string {
+  // ---------- helpers ----------
+  private ensureYYYYMM(mes?: string | Date): string {
+    if (mes instanceof Date) {
+      const y = mes.getUTCFullYear();
+      const m = String(mes.getUTCMonth() + 1).padStart(2, '0');
+      return `${y}-${m}`;
+    }
     if (mes && /^\d{4}-\d{2}$/.test(mes)) return mes;
     const now = new Date();
-    const y = now.getUTCFullYear();
-    const m = String(now.getUTCMonth() + 1).padStart(2, '0');
-    return `${y}-${m}`;
-  }
-  private fromDateToYYYYMM(d: Date): string {
-    const y = d.getUTCFullYear();
-    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
     return `${y}-${m}`;
   }
   private toYYYYMM01(mesYYYYMM: string) {
@@ -81,22 +83,39 @@ export class ReconciliationService {
   private nextMonthUTC(d: Date) {
     return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 0, 0, 0));
   }
-  /** Converte Decimal/number/string para number */
-  private toNum(v: unknown) {
+
+  /**
+   * Converte valores monetários vindos como:
+   * - number                      -> 297.81
+   * - "297.81" / "2.978,10"       -> 297.81
+   * - "R$ 297,81"                 -> 297.81
+   * - "29781" (centavos)          -> 297.81
+   */
+  private toNum(v: unknown): number {
     if (v == null) return 0;
-    if (typeof v === 'number') return v;
-    // Prisma.Decimal tem .toNumber()
-    if (typeof v === 'object' && v !== null && 'toNumber' in (v as any)) {
-      try {
-        return (v as any).toNumber();
-      } catch {
-        /* fallthrough */
-      }
+    if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+
+    const original = String(v).trim();
+    if (!original) return 0;
+
+    const raw = original.replace(/[^\d.,\-]/g, '');
+
+    let n = 0;
+    if (raw.includes(',')) {
+      // pt-BR
+      const cleaned = raw.replace(/\./g, '').replace(',', '.');
+      n = Number(cleaned);
+    } else if (raw.includes('.')) {
+      n = Number(raw);
+    } else {
+      const asInt = Number(raw);
+      n = Number.isInteger(asInt) && raw.length >= 3 ? asInt / 100 : asInt;
     }
-    const s = String(v).replace(/\./g, '').replace(',', '.'); // tolera pt-BR
-    const n = Number(s);
-    return Number.isFinite(n) ? n : 0;
+
+    if (!Number.isFinite(n)) return 0;
+    return n;
   }
+
   private toBRL(n: number) {
     return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
   }
@@ -105,11 +124,12 @@ export class ReconciliationService {
     return `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9, 11)}`;
   }
 
-  // Beneficiários **vigentes no mês** (entrou antes do mês seguinte e não saiu antes do 1º dia)
+  // where de beneficiários **vigentes no mês**
   private makeBenefWhereVigente(clientId: string, filters: Filters, start: Date, next: Date) {
     const where: Prisma.BeneficiarioWhereInput = {
       clientId,
       status: 'ATIVO',
+      // vigente no mês de referência:
       dataEntrada: { lt: next },
       OR: [{ dataSaida: null }, { dataSaida: { gte: start } }],
     };
@@ -119,9 +139,8 @@ export class ReconciliationService {
     return where;
   }
 
-  // ---------- Opções para filtros ----------
+  // ---------- opções ----------
   async getFilterOptions(clientId: string) {
-    // Opcionalmente podemos filtrar por mês de referência; por ora mantém ATIVO sem dataSaida.
     const [planos, centros] = await Promise.all([
       this.prisma.beneficiario.findMany({
         where: { clientId, status: 'ATIVO', dataSaida: null },
@@ -144,7 +163,7 @@ export class ReconciliationService {
     };
   }
 
-  // ---------- Conciliação ----------
+  // ---------- conciliação ----------
   async buildReconciliation(
     clientId: string,
     opts?: { mesReferencia?: Date | string; filters?: Filters },
@@ -152,21 +171,14 @@ export class ReconciliationService {
     const client = await this.prisma.client.findUnique({ where: { id: clientId }, select: { id: true } });
     if (!client) throw new NotFoundException('Cliente não encontrado.');
 
-    // aceita Date ou string YYYY-MM; default: mês atual (UTC)
-    const ym =
-      typeof opts?.mesReferencia === 'string'
-        ? this.ensureYYYYMM(opts.mesReferencia)
-        : opts?.mesReferencia instanceof Date
-        ? this.fromDateToYYYYMM(opts.mesReferencia)
-        : this.ensureYYYYMM();
-
+    const ym = this.ensureYYYYMM(opts?.mesReferencia);
     const firstDayStr = this.toYYYYMM01(ym); // para SQL
     const start = this.firstDayUTC(ym);
     const next = this.nextMonthUTC(start);
     const filters = opts?.filters ?? {};
     const anyFilter = !!(filters.tipo || filters.plano || filters.centro);
 
-    // 1) tenta ITENS da fatura
+    // 1) tenta ITENS
     let rows = await this.prisma.$queryRaw<FaturaRow[]>(Prisma.sql`
       SELECT i."id", i."nomeCompleto", i."cpf", i."valorPlano"
       FROM "health_imported_invoice_items" i
@@ -198,6 +210,7 @@ export class ReconciliationService {
       })
       .filter(Boolean) as Array<{ id: string; cpf: string; nome: string; valor: number }>;
 
+    // totais brutos de fatura (todos os itens)
     const faturaCount = flatFatura.length;
     const faturaSumNumber = flatFatura.reduce((acc, r) => acc + r.valor, 0);
 
@@ -215,6 +228,7 @@ export class ReconciliationService {
     }
     const ativosSet = new Set(mapAtivos.keys());
 
+    // agrega fatura por CPF (p/ detectar duplicados e somar cobranças por beneficiário)
     const byCpf = new Map<string, { nome: string; soma: number; valores: number[]; ids: string[] }>();
     for (const r of flatFatura) {
       const cur = byCpf.get(r.cpf) ?? { nome: r.nome, soma: 0, valores: [], ids: [] };
@@ -225,17 +239,24 @@ export class ReconciliationService {
       byCpf.set(r.cpf, cur);
     }
 
+    // coleções finais
     const onlyInInvoice: ReconTabs['onlyInInvoice'] = [];
     const onlyInRegistry: ReconTabs['onlyInRegistry'] = [];
     const mismatched: ReconTabs['mismatched'] = [];
     const duplicates: ReconTabs['duplicates'] = [];
     const allInvoice: ReconTabs['allInvoice'] = [];
 
-    // Divergências / Duplicados / Só na fatura
+    // acumuladores financeiros para cards
+    let onlyInInvoiceSumNum = 0;
+    let okSumNum = 0;
+    let okCount = 0;
+
+    // cruza fatura x cadastro
     for (const [cpf, info] of byCpf.entries()) {
       const ativo = mapAtivos.get(cpf);
+
       if (!ativo) {
-        // Só acrescenta "só na fatura" quando não há filtro — comportamento atual da UI
+        // Só na fatura (não mostra quando há filtro por vigência/plano/tipo/centro)
         if (!anyFilter) {
           onlyInInvoice.push({
             id: info.ids[0] ?? `INV:${cpf}`,
@@ -243,9 +264,11 @@ export class ReconciliationService {
             nome: info.nome || '—',
             valorCobrado: this.toBRL(info.soma),
           });
+          onlyInInvoiceSumNum += info.soma;
         }
         continue;
       }
+
       if (info.valores.length > 1) {
         duplicates.push({
           id: info.ids[0] ?? `DUP:${cpf}`,
@@ -256,6 +279,7 @@ export class ReconciliationService {
           valores: info.valores.map((v) => this.toBRL(v)),
         });
       }
+
       const diffAbs = Math.abs(info.soma - ativo.mensalidade);
       if (diffAbs > 0.009) {
         mismatched.push({
@@ -266,10 +290,14 @@ export class ReconciliationService {
           valorMensalidade: this.toBRL(ativo.mensalidade),
           diferenca: this.toBRL(info.soma - ativo.mensalidade),
         });
+      } else {
+        // Convergente (OK) por CPF somado
+        okSumNum += info.soma;
+        okCount += 1;
       }
     }
 
-    // Só no cadastro
+    // Só no cadastro (vigente sem linha de fatura)
     for (const [cpf, ativo] of mapAtivos.entries()) {
       if (!byCpf.has(cpf)) {
         onlyInRegistry.push({
@@ -281,10 +309,9 @@ export class ReconciliationService {
       }
     }
 
-    // Fatura (todos) + status
+    // Monta a visão "Fatura (todos)" linha-a-linha
     for (const r of flatFatura) {
-      if (anyFilter && !ativosSet.has(r.cpf)) continue; // se filtra por (tipo/plano/centro), mostra apenas os vigentes filtrados
-
+      if (anyFilter && !ativosSet.has(r.cpf)) continue;
       const ativo = mapAtivos.get(r.cpf);
       const mensal = ativo ? ativo.mensalidade : NaN;
       const diff = ativo ? r.valor - mensal : NaN;
@@ -309,64 +336,50 @@ export class ReconciliationService {
       });
     }
 
-    // NOVO: Convergentes (OK) derivados de allInvoice
-    const matched: ReconTabs['matched'] = allInvoice
-      .filter((r) => r.status === 'OK')
-      .map((r) => ({
-        id: r.id,
-        cpf: r.cpf,
-        nome: r.nome,
-        valorCobrado: r.valorCobrado,
-        valorMensalidade: r.valorMensalidade,
-        diferenca: r.diferenca,
-        status: 'OK' as const,
-      }));
-
-    // Ordenações por nome para consistência com UI
+    // ordenações estáveis
     const byNome = <T extends { nome: string }>(a: T, b: T) => a.nome.localeCompare(b.nome);
     onlyInInvoice.sort(byNome);
     onlyInRegistry.sort(byNome);
     mismatched.sort(byNome);
     duplicates.sort(byNome);
     allInvoice.sort(byNome);
-    matched.sort(byNome);
 
     return {
       ok: true,
       clientId,
       mesReferencia: this.toYYYYMM01(ym),
       totals: {
+        // contagens
         faturaCount,
-        faturaSum: this.toBRL(faturaSumNumber),
         ativosCount: mapAtivos.size,
         onlyInInvoice: onlyInInvoice.length,
         onlyInRegistry: onlyInRegistry.length,
         mismatched: mismatched.length,
         duplicates: duplicates.length,
-        matched: matched.length,
+        okCount,
+
+        // financeiros
+        faturaSum: this.toBRL(faturaSumNumber),
+        okSum: this.toBRL(okSumNum),
+        onlyInInvoiceSum: this.toBRL(onlyInInvoiceSumNum),
       },
       filtersApplied: filters,
-      tabs: { onlyInInvoice, onlyInRegistry, mismatched, duplicates, matched, allInvoice },
+      tabs: { onlyInInvoice, onlyInRegistry, mismatched, duplicates, allInvoice },
     };
   }
 
-  // ---------- Export ----------
+  // ---------- export ----------
   async exportReconciliation(
     clientId: string,
     opts: {
       mesReferencia?: Date | string;
       format: 'xlsx' | 'csv';
-      tab: 'mismatched' | 'onlyInInvoice' | 'onlyInRegistry' | 'duplicates' | 'matched' | 'all' | 'allInvoice';
+      tab: 'mismatched' | 'onlyInInvoice' | 'onlyInRegistry' | 'duplicates' | 'all' | 'allInvoice';
       filters?: Filters;
     },
   ): Promise<{ filename: string; contentType: string; buffer: Buffer }> {
     const payload = await this.buildReconciliation(clientId, {
-      mesReferencia:
-        typeof opts.mesReferencia === 'string'
-          ? opts.mesReferencia
-          : opts.mesReferencia instanceof Date
-          ? opts.mesReferencia
-          : undefined,
+      mesReferencia: opts.mesReferencia,
       filters: opts.filters,
     });
     const yyyymm = payload.mesReferencia.slice(0, 7);
@@ -416,17 +429,6 @@ export class ReconciliationService {
           Valores: r.valores.join(', '),
         })),
       },
-      matched: {
-        name: 'Convergentes',
-        rows: payload.tabs.matched.map((r) => ({
-          CPF: r.cpf,
-          Beneficiario: r.nome,
-          Valor_Cobrado: r.valorCobrado,
-          Valor_Mensalidade: r.valorMensalidade,
-          Diferenca: r.diferenca,
-          Status: r.status,
-        })),
-      },
       allInvoice: {
         name: 'Fatura_todos',
         rows: payload.tabs.allInvoice.map((r) => ({
@@ -460,9 +462,7 @@ export class ReconciliationService {
       };
     }
 
-    if (opts.tab === 'all') {
-      throw new Error('CSV não suporta "all" — escolha uma aba específica.');
-    }
+    if (opts.tab === 'all') throw new Error('CSV não suporta "all" — escolha uma aba específica.');
     const s = sheets[opts.tab as keyof typeof sheets];
     const ws = XLSX.utils.json_to_sheet(s.rows);
     const wb = XLSX.utils.book_new();
