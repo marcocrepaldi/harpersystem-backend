@@ -16,6 +16,9 @@ import { ServicesModule } from './services/services.module';
 import { BeneficiariesModule } from './beneficiaries/beneficiaries.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { ReconciliationModule } from './reconciliation/reconciliation.module';
+import { HealthPlanModule } from './healthplan/plans.module';
+import { ClientPlansModule } from './healthplan/client-plans.module';
+import { ImportErrorsModule } from './import-errors/import-errors.module';
 
 @Module({
   imports: [
@@ -31,7 +34,10 @@ import { ReconciliationModule } from './reconciliation/reconciliation.module';
     ServicesModule,
     BeneficiariesModule,
     InvoicesModule,
-    ReconciliationModule
+    ReconciliationModule,
+    HealthPlanModule,
+    ClientPlansModule,
+    ImportErrorsModule
   ],
   controllers: [AppController],
   providers: [

@@ -279,19 +279,20 @@ export class InvoicesService {
     const normFirst = normalized[0] || {};
     console.log('[Invoices] headers(normalized):', Object.keys(normFirst));
 
-    // (NOVO) filtro por credencial prefixada
+    // (NOVO) filtro por credencial prefixada — **somente mantém quem COMEÇA com o prefixo**
     const REQUIRED_PREFIX = (process.env.INVOICE_CREDENTIAL_PREFIX || '0TATM').toUpperCase();
     const kept = normalized.filter((rec) => {
       const cred = pick(rec, CREDENCIAL_ALIASES);
-      if (!cred) return true; // se não houver coluna, não filtramos
-      const prefix = String(cred).toUpperCase().slice(0, 5);
-      return prefix === REQUIRED_PREFIX;
+      // regra: se não houver credencial => DESCARTA
+      if (!cred) return false;
+      const prefix5 = String(cred).trim().toUpperCase().slice(0, 5);
+      return prefix5 === REQUIRED_PREFIX;
     });
 
     const dropped = normalized.length - kept.length;
-    if (dropped > 0) {
-      console.log(`[Invoices] Filtradas por credencial=${REQUIRED_PREFIX}: mantidas=${kept.length}, descartadas=${dropped}`);
-    }
+    console.log(
+      `[Invoices] Filtradas por credencial prefix=${REQUIRED_PREFIX} -> mantidas=${kept.length}, descartadas=${dropped}`,
+    );
 
     // mês de referência = 1º dia UTC do mês atual (ajuste se precisar ler do arquivo)
     const now = new Date();
@@ -398,7 +399,7 @@ export class InvoicesService {
       page,
       limit,
       data: faturas,
-      hasMore: (page * limit) < totalCount,
+      hasMore: page * limit < totalCount,
       mes: ym,
     };
   }

@@ -22,26 +22,25 @@ import { DeleteManyDto } from './dto/delete-many.dto';
 import { UpdateBeneficiaryDto } from './dto/update-beneficiary.dto';
 import { ParseCuidPipe } from '../common/pipes/parse-cuid.pipe';
 
-/**
- * Rotas de beneficiários por cliente
- * Base: /api/clients/:clientId/beneficiaries
- */
 @Controller('clients/:clientId/beneficiaries')
 export class BeneficiariesController {
   constructor(private readonly beneficiariesService: BeneficiariesService) {}
 
-  /** Lista beneficiários (titulares + dependentes) com filtros/paginação. */
+  /** Lista beneficiários com filtros e agora exibe todos por padrão. */
   @Get()
   findMany(
     @Param('clientId', ParseCuidPipe) clientId: string,
     @Query() query: FindBeneficiariesQueryDto,
   ) {
-    return this.beneficiariesService.findMany(clientId, query);
+    // Se nenhum parâmetro de paginação (page ou limit) for enviado,
+    // garantimos que a busca retorne todos os registros.
+    const queryWithAll = { ...query, all: true };
+    return this.beneficiariesService.findMany(clientId, queryWithAll);
   }
 
   /**
    * Importação em massa (CSV/XLS/XLSX).
-   * Validação de tipo de arquivo é tolerante e feita no service.
+   * Validação de tamanho; o service lida com tipo/parse.
    */
   @Post('upload')
   @HttpCode(200)
@@ -50,10 +49,7 @@ export class BeneficiariesController {
     @Param('clientId', ParseCuidPipe) clientId: string,
     @UploadedFile(
       new ParseFilePipe({
-        validators: [
-          // 50 MB
-          new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 }),
-        ],
+        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })],
       }),
     )
     file: Express.Multer.File,
@@ -61,7 +57,7 @@ export class BeneficiariesController {
     return this.beneficiariesService.processUpload(clientId, file);
   }
 
-  /** Cria um beneficiário (vida por vida). */
+  /** Cria um beneficiário (vida a vida). */
   @Post()
   @HttpCode(201)
   create(
@@ -71,7 +67,7 @@ export class BeneficiariesController {
     return this.beneficiariesService.create(clientId, createDto);
   }
 
-  /** Exclusão em massa. */
+  /** Exclusão em massa por IDs. */
   @Post('bulk-delete')
   @HttpCode(200)
   removeMany(
@@ -90,7 +86,7 @@ export class BeneficiariesController {
     return this.beneficiariesService.findOne(clientId, beneficiaryId);
   }
 
-  /** Atualiza um beneficiário. */
+  /** Atualiza parcialmente um beneficiário. */
   @Patch(':beneficiaryId')
   @HttpCode(200)
   update(

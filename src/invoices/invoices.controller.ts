@@ -6,16 +6,13 @@ import {
   Header,
   MaxFileSizeValidator,
   Param,
-  ParseFilePipe,
-  ParseIntPipe,
   Post,
   Query,
   UploadedFile,
   UseInterceptors,
-  FileTypeValidator,
   Body,
   Patch,
-  ParseArrayPipe,
+  ParseFilePipe,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { InvoicesService } from './invoices.service';
@@ -31,29 +28,36 @@ export class InvoicesController {
     @Param('clientId') clientId: string,
     @UploadedFile(
       new ParseFilePipe({
-        validators: [
-          new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 }),
-        ],
+        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })],
       }),
     )
     file: Express.Multer.File,
   ) {
-    if (!file) throw new BadRequestException('Nenhum arquivo enviado.');
+    if (!file) {
+      throw new BadRequestException('Nenhum arquivo enviado.');
+    }
 
-    const allowedMimeTypes = [
+    // Aceitos por MIME
+    const allowedMimeTypes = new Set([
       'text/csv',
       'application/csv',
       'application/vnd.ms-excel',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    ];
-    const isMimeTypeAllowed = allowedMimeTypes.includes(file.mimetype.toLowerCase());
+    ]);
 
-    if (!isMimeTypeAllowed) {
+    // Aceitos por extensão (fallback – alguns navegadores/fornecedores enviam MIME incorreto)
+    const allowedExtensions = ['.csv', '.xls', '.xlsx'];
+
+    const mimeOk = allowedMimeTypes.has((file.mimetype || '').toLowerCase());
+    const name = (file.originalname || '').toLowerCase();
+    const extOk = allowedExtensions.some((ext) => name.endsWith(ext));
+
+    if (!mimeOk && !extOk) {
       throw new BadRequestException(
-        `Tipo de arquivo não suportado: ${file.mimetype}. Tipos permitidos: .csv, .xls, .xlsx`,
+        `Tipo de arquivo não suportado (${file.mimetype || 'desconhecido'}). Envie um CSV, XLS ou XLSX.`,
       );
     }
-    
+
     return this.invoicesService.processInvoiceUpload(clientId, file);
   }
 
@@ -72,16 +76,21 @@ export class InvoicesController {
     @Param('clientId') clientId: string,
     @Query('mes') mes?: string,
   ) {
-    if (!mes) throw new BadRequestException('Parâmetro "mes" é obrigatório (YYYY-MM).');
+    if (!mes) {
+      throw new BadRequestException('Parâmetro "mes" é obrigatório (YYYY-MM).');
+    }
     if (!/^\d{4}-\d{2}$/.test(mes)) {
       throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
     }
+
     const [y, m] = mes.split('-').map(Number);
     const mesReferencia = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0, 0));
+
     return this.invoicesService.deleteInvoiceByMonth(clientId, mesReferencia);
   }
 
   @Patch('reconcile')
+  @Header('Cache-Control', 'no-store')
   async reconcileInvoices(
     @Param('clientId') clientId: string,
     @Body() body: reconcileInvoicesDTO,

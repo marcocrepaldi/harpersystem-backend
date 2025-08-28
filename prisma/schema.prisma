@@ -175,6 +175,12 @@ model Client {
   services ClientService[]   // many-to-many com Service
   tagLinks ClientTag[]       // many-to-many com Tag (nome escolhido para não colidir com tags[] legado)
 
+  // NOVO: vínculo com planos (tabela pivot)
+  healthPlans ClientHealthPlan[]
+
+  // NOVO: histórico de erros de importação
+  importErrors BeneficiarioImportError[]
+
   @@unique([corretorId, id])
   // ⚠️ NÃO usamos mais @@unique para email/document aqui por causa do soft delete.
   // Unicidade é garantida por índices parciais criados via SQL (ver migração).
@@ -280,6 +286,22 @@ model Beneficiario {
   @@map("health_beneficiaries")
 }
 
+model BeneficiarioImportError {
+  id         String   @id @default(cuid())
+  clientId   String
+  cliente    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  uploadedBy String?   // opcional: ID do usuário que importou
+  linha      Int       // linha da planilha com erro
+  motivo     String    // descrição do problema encontrado
+  dados      Json      // linha original da planilha
+
+  createdAt  DateTime  @default(now())
+
+  @@index([clientId, createdAt])
+  @@map("health_beneficiary_import_errors")
+}
+
 model FaturaImportada {
   id       String @id @default(cuid())
   clientId String
@@ -307,27 +329,22 @@ model FaturaItem {
   faturaId String
   fatura   FaturaImportada @relation(fields: [faturaId], references: [id], onDelete: Cascade)
 
-  // --- Espelho do layout da linha de fatura ---
   contrato         String?
   carteirinha      String?
   nomeCompleto     String?
   centroCusto      String?
   sexo             String?
-  tipo             String?     // "TITULAR" | "DEPENDENTE" em texto
+  tipo             String?
   estado           String?
   cpf              String?     @db.VarChar(14)
   dataNascimento   DateTime?
   faixaEtaria      String?
-  dataEntrada      DateTime?   // início vigência informado na fatura
+  dataEntrada      DateTime?
   dataSaida        DateTime?
   plano            String?
-  valorPlano       Decimal?    @db.Decimal(12, 2) // = Cobrado
+  valorPlano       Decimal?    @db.Decimal(12, 2)
   statusLinha      String?
-
-  // 👇 NOVO: credencial da operadora para filtrar Saúde/Dental
   credencial       String?     @db.VarChar(32)
-
-  // (opcionais — granularidade por item, se necessário)
   regimeCobranca   RegimeCobranca?
   motivoMovimento  MotivoMovimento?
   observacoes      String?
@@ -340,8 +357,92 @@ model FaturaItem {
   @@index([carteirinha])
   @@index([contrato])
   @@index([plano])
-  @@index([credencial]) // 👈 índice para filtro por prefixo
+  @@index([credencial])
   @@map("health_imported_invoice_items")
+}
+
+// ---------- HEALTH PLANOS / PREÇOS (NOVO) ----------
+model HealthPlan {
+  id       String  @id @default(cuid())
+  slug     String  @unique
+  name     String
+  isActive Boolean @default(true)
+
+  aliases PlanAlias[]
+  prices  HealthPlanPrice[]
+  clients ClientHealthPlan[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name])
+  @@map("health_plans")
+}
+
+model PlanAlias {
+  id     String     @id @default(cuid())
+  planId String
+  plan   HealthPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  alias  String
+
+  @@unique([planId, alias])
+  @@index([alias])
+  @@map("health_plan_aliases")
+}
+
+model HealthPlanPrice {
+  id             String         @id @default(cuid())
+  planId         String
+  plan           HealthPlan     @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  vigenciaInicio DateTime
+  vigenciaFim    DateTime?
+  faixaEtaria    String?
+  valor          Decimal        @db.Decimal(12, 2)
+  regimeCobranca RegimeCobranca?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([planId, vigenciaInicio, vigenciaFim])
+  @@index([planId, faixaEtaria])
+  @@map("health_plan_prices")
+}
+
+model ClientHealthPlan {
+  clientId String
+  planId   String
+  isActive Boolean @default(true)
+
+  client Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  plan   HealthPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  prices ClientHealthPlanPrice[]
+
+  @@id([clientId, planId])
+  @@index([planId])
+  @@map("client_health_plans")
+}
+
+model ClientHealthPlanPrice {
+  id       String @id @default(cuid())
+  clientId String
+  planId   String
+
+  clientPlan ClientHealthPlan @relation(fields: [clientId, planId], references: [clientId, planId], onDelete: Cascade)
+
+  vigenciaInicio DateTime
+  vigenciaFim    DateTime?
+  faixaEtaria    String?
+  valor          Decimal @db.Decimal(12, 2)
+  regimeCobranca RegimeCobranca?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId, planId, vigenciaInicio, vigenciaFim])
+  @@index([clientId, planId, faixaEtaria])
+  @@map("client_health_plan_prices")
 }
 
 // ---------- NORMALIZAÇÃO ----------
@@ -389,14 +490,14 @@ model Contact {
 // ---------- SERVICES / TAGS (NOVO) ----------
 model Service {
   id       String         @id @default(cuid())
-  slug     String         @unique           // ex.: SAUDE, ODONTO, VIDA, AUTO...
+  slug     String         @unique
   name     String
   isActive Boolean        @default(true)
 
   clients  ClientService[]
 
   @@index([slug], map: "idx_service_slug")
-  @@index([name]) // auxiliar para ordenação/listagem no picker
+  @@index([name])
   @@map("services")
 }
 
@@ -409,19 +510,19 @@ model ClientService {
 
   @@id([clientId, serviceId])
   @@index([serviceId])
-  @@index([clientId]) // 🔎 busca rápida por cliente
+  @@index([clientId])
   @@map("client_services")
 }
 
 model Tag {
   id       String     @id @default(cuid())
-  slug     String     @unique             // ex.: "vip", "sinistro-recente"
+  slug     String     @unique
   name     String
   isActive Boolean    @default(true)
 
   clients  ClientTag[]
 
-  @@index([name]) // auxiliar para ordenação/listagem
+  @@index([name])
   @@map("tags")
 }
 
@@ -434,7 +535,7 @@ model ClientTag {
 
   @@id([clientId, tagId])
   @@index([tagId])
-  @@index([clientId]) // 🔎 busca rápida por cliente
+  @@index([clientId])
   @@map("client_tags")
 }
 
@@ -442,9 +543,9 @@ model ClientTag {
 model AuditLog {
   id         String   @id @default(cuid())
   corretorId String
-  entity     String   // "client" | "address" | "contact"
+  entity     String
   entityId   String
-  action     String   // "create" | "update" | "delete" | "restore"
+  action     String
   before     Json?
   after      Json?
   actorId    String?
