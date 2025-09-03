@@ -11,6 +11,22 @@ import { UploadBase64Dto } from './dto/upload-base64.dto';
 // converte enum DTO -> enum Prisma (string idêntica)
 const mapCategory = (c?: DocumentCategoryDto): any => c ?? 'ANEXO';
 
+// limites
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || '52428800', 10); // 50MB default
+const BASE64_RE = /^[A-Za-z0-9+/=\r\n]+$/;
+const DATAURL_PREFIX_RE = /^data:([\w.+-]+\/[\w.+-]+);base64,/i;
+
+// mapa simples mime->ext de fallback
+const MIME_EXT: Record<string, string> = {
+  'application/pdf': '.pdf',
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'application/octet-stream': '',
+};
+
 @Injectable()
 export class DocumentsService {
   constructor(private readonly prisma: PrismaService) {}
@@ -24,12 +40,33 @@ export class DocumentsService {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
 
+  /** Extrai mime a partir de um dataURL, se houver */
+  private mimeFromBase64(data: string): string | null {
+    const m = data.match(DATAURL_PREFIX_RE);
+    return m ? m[1].toLowerCase() : null;
+  }
+
+  /** Normaliza e valida o base64; aplica limite de tamanho */
   private parseBase64(b64: string): Buffer {
     const pure = b64.includes(',') ? b64.split(',').pop()! : b64;
-    if (!pure || !/^[A-Za-z0-9+/=\r\n]+$/.test(pure)) {
+    if (!pure || !BASE64_RE.test(pure)) {
       throw new BadRequestException('base64 inválido.');
     }
-    return Buffer.from(pure, 'base64');
+    // tamanho aproximado pré-decodificação para proteger antes de alocar
+    // (cada 4 chars base64 ~ 3 bytes)
+    const approxBytes = Math.floor((pure.replace(/\s+/g, '').length * 3) / 4);
+    if (approxBytes > MAX_UPLOAD_BYTES * 1.1) {
+      // pequena folga por conta de padding
+      const mb = (MAX_UPLOAD_BYTES / (1024 * 1024)).toFixed(0);
+      throw new BadRequestException(`Arquivo excede o tamanho máximo de ${mb}MB.`);
+    }
+
+    const buf = Buffer.from(pure, 'base64');
+    if (buf.byteLength > MAX_UPLOAD_BYTES) {
+      const mb = (MAX_UPLOAD_BYTES / (1024 * 1024)).toFixed(0);
+      throw new BadRequestException(`Arquivo excede o tamanho máximo de ${mb}MB.`);
+    }
+    return buf;
   }
 
   private sha256(buf: Buffer) {
@@ -47,6 +84,15 @@ export class DocumentsService {
       return path.join(process.cwd(), rel);
     }
     return path.isAbsolute(storageKey) ? storageKey : path.join(process.cwd(), storageKey);
+  }
+
+  /** Deriva uma extensão segura a partir do filename e/ou mime */
+  private safeExt(filename: string, mime?: string | null): string {
+    const fromName = path.extname(filename || '').toLowerCase();
+    if (fromName && fromName.length <= 6) return fromName; // ex: .pdf .jpeg
+
+    const fromMime = (mime && MIME_EXT[mime.toLowerCase()]) || '';
+    return fromMime || '';
   }
 
   async create(
@@ -89,11 +135,18 @@ export class DocumentsService {
     const client = await this.prisma.client.findFirst({ where: { id: clientId, corretorId } });
     if (!client) throw new NotFoundException('Cliente não encontrado.');
 
+    // decodifica e valida tamanho
     const buf = this.parseBase64(dto.base64);
     const sha = this.sha256(buf);
 
+    // tenta inferir mime do dataURL caso venha diferente
+    const mimeFromData = this.mimeFromBase64(dto.base64);
+    const mime = (mimeFromData || dto.mimeType || 'application/octet-stream').toLowerCase();
+
     const uuid = randomUUID();
-    const ext = path.extname(dto.filename || '') || '';
+    const ext = this.safeExt(dto.filename || '', mime);
+    const finalFilename = dto.filename || `${uuid}${ext || ''}`;
+
     const dir = path.join(this.baseUploadDir(), 'tenants', corretorId, 'clients', clientId);
     this.ensureDirSync(dir);
     const full = path.join(dir, `${uuid}${ext}`);
@@ -105,8 +158,8 @@ export class DocumentsService {
         corretorId,
         clientId,
         policyId: dto.policyId ?? null,
-        filename: dto.filename,
-        mimeType: dto.mimeType,
+        filename: finalFilename,
+        mimeType: mime,
         size: buf.byteLength,
         category: mapCategory(dto.category),
         tags: dto.tags ?? [],

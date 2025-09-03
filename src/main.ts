@@ -5,6 +5,7 @@ import { Logger, ValidationPipe } from '@nestjs/common';
 // import helmet from 'helmet'; // recomendado em produção
 import { json, urlencoded } from 'express';
 import compression from 'compression';
+import { RedactExceptionFilter } from './common/filters/redact-exception.filter';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
@@ -14,7 +15,6 @@ async function bootstrap() {
   const port = Number(process.env.PORT ?? 3001);
 
   // Prefixo global (sanitizado: sem barra inicial)
-  // Use API_PREFIX=api (sem "/"). Se vier com "/", a gente remove.
   const rawPrefix = String(process.env.API_PREFIX ?? 'api');
   const prefix = rawPrefix.replace(/^\/+/, '') || 'api';
   app.setGlobalPrefix(prefix);
@@ -24,12 +24,12 @@ async function bootstrap() {
   app.use(json({ limit: bodyLimit }));
   app.use(urlencoded({ limit: bodyLimit, extended: true }));
 
-  // Compressão (ajuda no tráfego de JSON grande)
+  // Compressão
   app.use(compression());
 
   // trust proxy (se estiver atrás de proxy/ingress)
   if (process.env.TRUST_PROXY?.toLowerCase() === 'true') {
-    // @ts-ignore - propriedade do Express
+    // @ts-ignore
     app.set('trust proxy', 1);
   }
 
@@ -42,21 +42,16 @@ async function bootstrap() {
 
   app.enableCors({
     origin: (origin, cb) => {
-      // Sem Origin (curl/postman) => permitir
-      if (!origin) return cb(null, true);
-
-      // Curinga explícito
+      if (!origin) return cb(null, true); // curl/postman
       if (allowlist.includes('*')) return cb(null, true);
 
       if (!isProd) {
-        // Dev: permitir localhost, 127.0.0.1 e subdomínios *.localhost
         const ok =
           /^https?:\/\/([a-z0-9-]+\.)?localhost(?::\d+)?$/i.test(origin) ||
           /^https?:\/\/127\.0\.0\.1(?::\d+)?$/i.test(origin);
         return cb(ok ? null : new Error(`CORS dev: origem não permitida: ${origin}`), ok);
       }
 
-      // Produção: restringe à allowlist (aceita também padrões regex iniciados por ^)
       const ok = allowlist.some((o) => {
         if (o.startsWith('^')) {
           try {
@@ -79,7 +74,7 @@ async function bootstrap() {
       'x-tenant-code',
     ],
     exposedHeaders: ['Content-Disposition'],
-    maxAge: 600, // cache do preflight
+    maxAge: 600,
   });
 
   // Segurança HTTP (recomendada em produção)
@@ -87,15 +82,20 @@ async function bootstrap() {
   //   app.use(helmet({ contentSecurityPolicy: false }));
   // }
 
-  // Validação global
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      transform: true,
-      transformOptions: { enableImplicitConversion: true },
-    }),
-  );
+  // Validação global (sem refletir payload gigante em erros)
+app.useGlobalPipes(
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: { enableImplicitConversion: true },
+    // evita refletir payload (value/target) — não manda base64 nos erros de DTO
+    validationError: { target: false, value: false },
+  }),
+);
+
+  // Filtro global para sanitizar respostas de erro (remove base64/strings enormes)
+  app.useGlobalFilters(new RedactExceptionFilter());
 
   // Encerramento gracioso
   app.enableShutdownHooks();
