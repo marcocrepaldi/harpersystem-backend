@@ -96,7 +96,12 @@ function mapParentescoToTipo(raw?: any): BeneficiarioTipo | null {
 
   if (!v) return null;
   if (v.startsWith('TITULAR')) return BeneficiarioTipo.TITULAR;
-  if (v.includes('CONJUGE') || v.includes('ESPOSA') || v.includes('ESPOSO') || v.includes('COMPANHEIR')) {
+  if (
+    v.includes('CONJUGE') ||
+    v.includes('ESPOSA') ||
+    v.includes('ESPOSO') ||
+    v.includes('COMPANHEIR')
+  ) {
     return BeneficiarioTipo.CONJUGE;
   }
   if (v.includes('FILHO') || v.includes('DEPENDENTE') || v.includes('ENTEAD')) {
@@ -108,11 +113,35 @@ function mapParentescoToTipo(raw?: any): BeneficiarioTipo | null {
 /** Label amigável para o front */
 function tipoLabel(t: BeneficiarioTipo): 'Titular' | 'Filho' | 'Cônjuge' {
   switch (t) {
-    case BeneficiarioTipo.TITULAR: return 'Titular';
-    case BeneficiarioTipo.FILHO: return 'Filho';
-    case BeneficiarioTipo.CONJUGE: return 'Cônjuge';
+    case BeneficiarioTipo.TITULAR:
+      return 'Titular';
+    case BeneficiarioTipo.FILHO:
+      return 'Filho';
+    case BeneficiarioTipo.CONJUGE:
+      return 'Cônjuge';
   }
 }
+
+/** Normaliza texto p/ casar com alias/slug/nome do plano */
+function normalizePlanKey(s: any): string | null {
+  if (s == null) return null;
+  const str = String(s).trim();
+  if (!str) return null;
+  return str
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/** chave p/ cache local de preço */
+const priceCacheKey = (
+  clientId: string,
+  planId: string,
+  dtIso: string,
+  faixa?: string | null,
+) => `${clientId}|${planId}|${dtIso}|${faixa ?? ''}`;
 
 /* ======================= Service ======================= */
 
@@ -120,83 +149,196 @@ function tipoLabel(t: BeneficiarioTipo): 'Titular' | 'Filho' | 'Cônjuge' {
 export class BeneficiariesService {
   constructor(private readonly prisma: PrismaService) {}
 
-  /** Listagem com filtros e paginação */
-/** Listagem com filtros (sem paginação: retorna todos) */
-async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
-  const clientExists = await this.prisma.client.findUnique({ where: { id: clientId } });
-  if (!clientExists) throw new NotFoundException(`Cliente com ID ${clientId} não encontrado.`);
+  /** Busca plano e preço correto (cliente > global) para data/faixa. */
+  private async lookupCorrectPrice(
+    tx: Prisma.TransactionClient | PrismaService,
+    params: {
+      clientId: string;
+      planoRaw?: any;
+      dataEntrada: Date;
+      faixaEtaria?: string | null;
+    },
+  ): Promise<{ planId: string | null; price: number | undefined }> {
+    const { clientId, planoRaw, dataEntrada, faixaEtaria } = params;
 
-  const where: Prisma.BeneficiarioWhereInput = { clientId };
+    const key = normalizePlanKey(planoRaw);
+    if (!key) return { planId: null, price: undefined };
 
-  if (query.tipo) {
-    const t = String(query.tipo).toUpperCase();
-    if (t === 'DEPENDENTE') {
-      where.tipo = { in: [BeneficiarioTipo.FILHO, BeneficiarioTipo.CONJUGE] };
-    } else if (t === 'TITULAR' || t === 'FILHO' || t === 'CONJUGE') {
-      where.tipo = t as BeneficiarioTipo;
+    // Encontra plano por alias/slug/name
+    const plan =
+      (await tx.healthPlan.findFirst({
+        where: {
+          OR: [
+            { aliases: { some: { alias: key } } }, // planAlias.alias já normalizado
+            { slug: key },
+            { name: { equals: key, mode: 'insensitive' } },
+          ],
+        },
+        select: { id: true },
+      })) ??
+      (await tx.healthPlan.findFirst({
+        where: {
+          OR: [
+            { name: { startsWith: String(planoRaw), mode: 'insensitive' } },
+            { slug: { startsWith: key } },
+          ],
+        },
+        select: { id: true },
+      }));
+
+    if (!plan) return { planId: null, price: undefined };
+
+    // Cache simples por requisição
+    (this as any)._priceCache ||= new Map<string, number | undefined>();
+    const cache = (this as any)._priceCache as Map<string, number | undefined>;
+    const iso = dataEntrada.toISOString().slice(0, 10);
+    const cacheKey = priceCacheKey(clientId, plan.id, iso, faixaEtaria ?? undefined);
+    if (cache.has(cacheKey)) return { planId: plan.id, price: cache.get(cacheKey) };
+
+    // 1) preço por CLIENTE com mesma faixa
+    const byClientExact = await tx.clientHealthPlanPrice.findFirst({
+      where: {
+        clientId,
+        planId: plan.id,
+        faixaEtaria: faixaEtaria ?? undefined,
+        vigenciaInicio: { lte: dataEntrada },
+        OR: [{ vigenciaFim: null }, { vigenciaFim: { gte: dataEntrada } }],
+      },
+      orderBy: [{ vigenciaInicio: 'desc' }],
+    });
+    if (byClientExact) {
+      const v = byClientExact.valor?.toNumber?.() ?? Number(byClientExact.valor);
+      cache.set(cacheKey, v);
+      return { planId: plan.id, price: v };
     }
+
+    // 2) preço por CLIENTE sem faixa
+    const byClientAny = await tx.clientHealthPlanPrice.findFirst({
+      where: {
+        clientId,
+        planId: plan.id,
+        vigenciaInicio: { lte: dataEntrada },
+        OR: [{ vigenciaFim: null }, { vigenciaFim: { gte: dataEntrada } }],
+      },
+      orderBy: [{ faixaEtaria: 'asc' }, { vigenciaInicio: 'desc' }],
+    });
+    if (byClientAny) {
+      const v = byClientAny.valor?.toNumber?.() ?? Number(byClientAny.valor);
+      cache.set(cacheKey, v);
+      return { planId: plan.id, price: v };
+    }
+
+    // 3) preço GLOBAL com mesma faixa
+    const byGlobalExact = await tx.healthPlanPrice.findFirst({
+      where: {
+        planId: plan.id,
+        faixaEtaria: faixaEtaria ?? undefined,
+        vigenciaInicio: { lte: dataEntrada },
+        OR: [{ vigenciaFim: null }, { vigenciaFim: { gte: dataEntrada } }],
+      },
+      orderBy: [{ vigenciaInicio: 'desc' }],
+    });
+    if (byGlobalExact) {
+      const v = byGlobalExact.valor?.toNumber?.() ?? Number(byGlobalExact.valor);
+      cache.set(cacheKey, v);
+      return { planId: plan.id, price: v };
+    }
+
+    // 4) preço GLOBAL sem faixa
+    const byGlobalAny = await tx.healthPlanPrice.findFirst({
+      where: {
+        planId: plan.id,
+        vigenciaInicio: { lte: dataEntrada },
+        OR: [{ vigenciaFim: null }, { vigenciaFim: { gte: dataEntrada } }],
+      },
+      orderBy: [{ faixaEtaria: 'asc' }, { vigenciaInicio: 'desc' }],
+    });
+    if (byGlobalAny) {
+      const v = byGlobalAny.valor?.toNumber?.() ?? Number(byGlobalAny.valor);
+      cache.set(cacheKey, v);
+      return { planId: plan.id, price: v };
+    }
+
+    cache.set(cacheKey, undefined);
+    return { planId: plan.id, price: undefined };
   }
 
-  if (query.status) where.status = query.status;
+  /** Listagem com filtros (sem paginação: retorna todos) */
+  async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
+    const clientExists = await this.prisma.client.findUnique({ where: { id: clientId } });
+    if (!clientExists) throw new NotFoundException(`Cliente com ID ${clientId} não encontrado.`);
 
-  if (query.search) {
-    const searchDigits = query.search.replace(/\D/g, '');
-    where.OR = [
-      { nomeCompleto: { contains: query.search, mode: 'insensitive' } },
-      ...(searchDigits ? [{ cpf: { contains: searchDigits } } as Prisma.BeneficiarioWhereInput] : []),
-      { carteirinha: { contains: query.search, mode: 'insensitive' } },
-      { contrato: { contains: query.search, mode: 'insensitive' } },
-      { plano: { contains: query.search, mode: 'insensitive' } },
-    ];
+    const where: Prisma.BeneficiarioWhereInput = { clientId };
+
+    if (query.tipo) {
+      const t = String(query.tipo).toUpperCase();
+      if (t === 'DEPENDENTE') {
+        where.tipo = { in: [BeneficiarioTipo.FILHO, BeneficiarioTipo.CONJUGE] };
+      } else if (t === 'TITULAR' || t === 'FILHO' || t === 'CONJUGE') {
+        where.tipo = t as BeneficiarioTipo;
+      }
+    }
+
+    if (query.status) where.status = query.status;
+
+    if (query.search) {
+      const searchDigits = query.search.replace(/\D/g, '');
+      where.OR = [
+        { nomeCompleto: { contains: query.search, mode: 'insensitive' } },
+        ...(searchDigits ? [{ cpf: { contains: searchDigits } } as Prisma.BeneficiarioWhereInput] : []),
+        { carteirinha: { contains: query.search, mode: 'insensitive' } },
+        { contrato: { contains: query.search, mode: 'insensitive' } },
+        { plano: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
+
+    // >>> Sem paginação
+    const [total, items] = await this.prisma.$transaction([
+      this.prisma.beneficiario.count({ where }),
+      this.prisma.beneficiario.findMany({
+        where,
+        orderBy: [{ tipo: 'asc' }, { nomeCompleto: 'asc' }],
+        include: { titular: { select: { id: true, nomeCompleto: true } } },
+      }),
+    ]);
+
+    const mappedItems = items.map((b) => ({
+      id: b.id,
+      nomeCompleto: b.nomeCompleto,
+      cpf: b.cpf,
+      tipo:
+        b.tipo === BeneficiarioTipo.TITULAR ? 'Titular' :
+        b.tipo === BeneficiarioTipo.FILHO ? 'Filho' : 'Cônjuge',
+      valorMensalidade: b.valorMensalidade != null ? Number(b.valorMensalidade) : null,
+      status: b.status === BeneficiarioStatus.ATIVO ? 'Ativo' : 'Inativo',
+      titularId: b.titularId,
+      titularNome: b.titular?.nomeCompleto ?? null,
+      matricula: b.matricula,
+      carteirinha: b.carteirinha,
+      sexo: (b.sexo as 'M' | 'F' | null) ?? null,
+      dataNascimento: b.dataNascimento?.toISOString().substring(0, 10),
+      dataEntrada: b.dataEntrada.toISOString().substring(0, 10),
+      dataSaida: b.dataSaida?.toISOString().substring(0, 10) ?? null,
+      plano: b.plano,
+      centroCusto: b.centroCusto,
+      faixaEtaria: b.faixaEtaria,
+      estado: b.estado,
+      contrato: b.contrato,
+      comentario: b.comentario,
+      regimeCobranca: b.regimeCobranca,
+      motivoMovimento: b.motivoMovimento,
+      observacoes: b.observacoes ?? null,
+      idade: calcularIdade(b.dataNascimento),
+    }));
+
+    // Mantém o shape, mas sem paginação real
+    return {
+      items: mappedItems,
+      page: 1,
+      limit: items.length,
+      total,
+    };
   }
-
-  // >>> Sem paginação
-  const [total, items] = await this.prisma.$transaction([
-    this.prisma.beneficiario.count({ where }),
-    this.prisma.beneficiario.findMany({
-      where,
-      orderBy: [{ tipo: 'asc' }, { nomeCompleto: 'asc' }],
-      include: { titular: { select: { id: true, nomeCompleto: true } } },
-    }),
-  ]);
-
-  const mappedItems = items.map((b) => ({
-    id: b.id,
-    nomeCompleto: b.nomeCompleto,
-    cpf: b.cpf,
-    tipo:
-      b.tipo === BeneficiarioTipo.TITULAR ? 'Titular' :
-      b.tipo === BeneficiarioTipo.FILHO ? 'Filho' : 'Cônjuge',
-    valorMensalidade: b.valorMensalidade != null ? Number(b.valorMensalidade) : null,
-    status: b.status === BeneficiarioStatus.ATIVO ? 'Ativo' : 'Inativo',
-    titularId: b.titularId,
-    titularNome: b.titular?.nomeCompleto ?? null,
-    matricula: b.matricula,
-    carteirinha: b.carteirinha,
-    sexo: (b.sexo as 'M' | 'F' | null) ?? null,
-    dataNascimento: b.dataNascimento?.toISOString().substring(0, 10),
-    dataEntrada: b.dataEntrada.toISOString().substring(0, 10),
-    dataSaida: b.dataSaida?.toISOString().substring(0, 10) ?? null,
-    plano: b.plano,
-    centroCusto: b.centroCusto,
-    faixaEtaria: b.faixaEtaria,
-    estado: b.estado,
-    contrato: b.contrato,
-    comentario: b.comentario,
-    regimeCobranca: b.regimeCobranca,
-    motivoMovimento: b.motivoMovimento,
-    observacoes: b.observacoes ?? null,
-    idade: calcularIdade(b.dataNascimento),
-  }));
-
-  // Mantém o shape, mas sem paginação real
-  return {
-    items: mappedItems,
-    page: 1,
-    limit: items.length,
-    total,
-  };
-}
 
   /** Criação individual */
   async create(clientId: string, dto: CreateBeneficiaryDto) {
@@ -283,9 +425,7 @@ async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
     return { isCsv, isExcel, name, mime };
   }
 
-  /** Importação em massa com registro de erros */
-/** Importação em massa com registro de erros */
-  /** Importação em massa com registro de erros + relatório */
+  /** Importação em massa com registro de erros + relatório + correção de preço por tabela */
   async processUpload(clientId: string, file: Express.Multer.File) {
     if (!file) throw new BadRequestException('Nenhum arquivo enviado.');
     const { isCsv, isExcel, name, mime } = this.isCsvOrExcel(file);
@@ -301,18 +441,25 @@ async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
         const workbook = xlsx.read(file.buffer, { type: 'buffer' });
         records = xlsx.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
       } else {
-        throw new BadRequestException(`Tipo de arquivo não suportado: ${mime} (${name}). Envie CSV, XLS ou XLSX.`);
+        throw new BadRequestException(
+          `Tipo de arquivo não suportado: ${mime} (${name}). Envie CSV, XLS ou XLSX.`,
+        );
       }
     } catch {
       throw new BadRequestException('Falha ao ler o arquivo. Verifique o formato.');
     }
 
     // --- métricas/relatório
-    let created = 0, updated = 0;
-    let createdTitulares = 0, updatedTitulares = 0, createdDependentes = 0, updatedDependentes = 0;
+    let created = 0,
+      updated = 0;
+    let createdTitulares = 0,
+      updatedTitulares = 0,
+      createdDependentes = 0,
+      updatedDependentes = 0;
     const errors: { linha: number; motivo: string; dados: any }[] = [];
     const errorCounts = new Map<string, number>();
-    const incErr = (motivo: string) => errorCounts.set(motivo, (errorCounts.get(motivo) ?? 0) + 1);
+    const incErr = (motivo: string) =>
+      errorCounts.set(motivo, (errorCounts.get(motivo) ?? 0) + 1);
 
     // --- colunas esperadas
     const COLUMN_MAP = {
@@ -337,181 +484,215 @@ async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
     const titularesMap = new Map<string, string>(); // matrícula -> ID salvo
     const titularesRejeitados = new Map<string, { linha: number; motivo: string }>(); // matrícula -> motivo/linha
 
-    await this.prisma.$transaction(async (tx) => {
-      // ================= TITULARES =================
-      for (const [index, record] of records.entries()) {
-        const tipoCsv = mapParentescoToTipo(getField(record, COLUMN_MAP.parentesco));
-        if (tipoCsv !== BeneficiarioTipo.TITULAR) continue;
+    // ================= TITULARES =================
+    for (const [index, record] of records.entries()) {
+      const tipoCsv = mapParentescoToTipo(getField(record, COLUMN_MAP.parentesco));
+      if (tipoCsv !== BeneficiarioTipo.TITULAR) continue;
 
-        const linha = index + 2;
-        const nome = getField(record, COLUMN_MAP.nome);
-        const cpfRaw = getField(record, COLUMN_MAP.cpf);
-        const matricula = getField(record, COLUMN_MAP.matricula);
+      const linha = index + 2;
+      const nome = getField(record, COLUMN_MAP.nome);
+      const cpfRaw = getField(record, COLUMN_MAP.cpf);
+      const matricula = getField(record, COLUMN_MAP.matricula);
 
-        if (!nome || !cpfRaw || !matricula) {
-          const motivo = 'Campos obrigatórios ausentes';
-          errors.push({ linha, motivo, dados: record });
-          incErr(motivo);
-          titularesRejeitados.set(String(matricula), { linha, motivo });
-          continue;
-        }
+      if (!nome || !cpfRaw || !matricula) {
+        const motivo = 'Campos obrigatórios ausentes';
+        errors.push({ linha, motivo, dados: record });
+        incErr(motivo);
+        titularesRejeitados.set(String(matricula), { linha, motivo });
+        continue;
+      }
 
-        const cpfNorm = normalizeCpf(cpfRaw);
-        if (!cpfNorm || !isValidCpf(cpfNorm)) {
-          const motivo = `Titular rejeitado: CPF inválido`;
-          errors.push({ linha, motivo, dados: record });
-          incErr('CPF inválido');
-          titularesRejeitados.set(String(matricula), { linha, motivo });
-          continue;
-        }
+      const cpfNorm = normalizeCpf(cpfRaw);
+      if (!cpfNorm || !isValidCpf(cpfNorm)) {
+        const motivo = `Titular rejeitado: CPF inválido`;
+        errors.push({ linha, motivo, dados: record });
+        incErr('CPF inválido');
+        titularesRejeitados.set(String(matricula), { linha, motivo });
+        continue;
+      }
 
-        const dataEntrada = excelSerialDateToJSDate(Number(getField(record, COLUMN_MAP.dataInicio)));
-        if (!dataEntrada) {
-          const motivo = 'Data de entrada inválida';
-          errors.push({ linha, motivo, dados: record });
-          incErr(motivo);
-          titularesRejeitados.set(String(matricula), { linha, motivo });
-          continue;
-        }
+      const dataEntrada = excelSerialDateToJSDate(
+        Number(getField(record, COLUMN_MAP.dataInicio)),
+      );
+      if (!dataEntrada) {
+        const motivo = 'Data de entrada inválida';
+        errors.push({ linha, motivo, dados: record });
+        incErr(motivo);
+        titularesRejeitados.set(String(matricula), { linha, motivo });
+        continue;
+      }
 
-        const dataNasc = excelSerialDateToJSDate(Number(getField(record, COLUMN_MAP.dataNascimento)));
-        const faixaPlanilha = String(getField(record, COLUMN_MAP.faixaEtaria) ?? '').trim() || undefined;
-        const faixaCalc = faixaFromIdade(calcularIdade(dataNasc ?? undefined));
-        const faixaFinal = faixaPlanilha || faixaCalc;
+      const dataNasc = excelSerialDateToJSDate(
+        Number(getField(record, COLUMN_MAP.dataNascimento)),
+      );
+      const faixaPlanilha =
+        String(getField(record, COLUMN_MAP.faixaEtaria) ?? '').trim() || undefined;
+      const faixaCalc = faixaFromIdade(calcularIdade(dataNasc ?? undefined));
+      const faixaFinal = faixaPlanilha || faixaCalc;
 
-        const baseUnchecked: Prisma.BeneficiarioUncheckedCreateInput = {
+      // preço correto (cliente > global). Se não houver, cai no valor da planilha.
+      const { price } = await this.lookupCorrectPrice(this.prisma, {
+        clientId,
+        planoRaw: getField(record, COLUMN_MAP.plano),
+        dataEntrada,
+        faixaEtaria: faixaFinal ?? null,
+      });
+
+      const valorFromSheet = toNumberLoose(getField(record, COLUMN_MAP.valorMensalidade));
+      const valorFinal = price ?? valorFromSheet;
+
+      const baseUnchecked: Prisma.BeneficiarioUncheckedCreateInput = {
+        clientId,
+        nomeCompleto: String(nome).trim(),
+        cpf: cpfNorm,
+        tipo: BeneficiarioTipo.TITULAR,
+        dataEntrada,
+        status: BeneficiarioStatus.ATIVO,
+        valorMensalidade: valorFinal,
+        matricula: String(matricula),
+        carteirinha: String(getField(record, COLUMN_MAP.carteirinha) ?? ''),
+        sexo: normalizeSexo(getField(record, COLUMN_MAP.sexo)) ?? undefined,
+        dataNascimento: dataNasc ?? undefined,
+        plano: String(getField(record, COLUMN_MAP.plano) ?? '') || undefined,
+        centroCusto: String(getField(record, COLUMN_MAP.centroCusto) ?? '') || undefined,
+        faixaEtaria: faixaFinal ?? undefined,
+        estado: String(getField(record, COLUMN_MAP.estado) ?? '') || undefined,
+        contrato: String(getField(record, COLUMN_MAP.contrato) ?? '') || undefined,
+        comentario: String(getField(record, COLUMN_MAP.comentario) ?? '') || undefined,
+      };
+
+      const existing = await this.prisma.beneficiario.findUnique({
+        where: { clientId_cpf: { clientId, cpf: cpfNorm } },
+      });
+
+      const upsertedTitular = await this.prisma.beneficiario.upsert({
+        where: { clientId_cpf: { clientId, cpf: cpfNorm } },
+        update: {
+          ...baseUnchecked,
+          clientId: undefined, // não altere o clientId em updates
+        },
+        create: { ...baseUnchecked },
+      });
+
+      if (existing) {
+        updated++;
+        updatedTitulares++;
+      } else {
+        created++;
+        createdTitulares++;
+      }
+
+      // matrícula -> id salvo
+      titularesMap.set(String(matricula), upsertedTitular.id);
+    }
+
+    // ================= DEPENDENTES =================
+    for (const [index, record] of records.entries()) {
+      const tipoCsv = mapParentescoToTipo(getField(record, COLUMN_MAP.parentesco));
+      if (!tipoCsv || tipoCsv === BeneficiarioTipo.TITULAR) continue;
+
+      const linha = index + 2;
+      const nome = getField(record, COLUMN_MAP.nome);
+      const cpfRaw = getField(record, COLUMN_MAP.cpf);
+      const matriculaTitular = getField(record, COLUMN_MAP.matricula);
+
+      if (!nome || !cpfRaw || !matriculaTitular) {
+        const motivo = 'Campos obrigatórios ausentes';
+        errors.push({ linha, motivo, dados: record });
+        incErr(motivo);
+        continue;
+      }
+
+      const cpfNorm = normalizeCpf(cpfRaw);
+      if (!cpfNorm || !isValidCpf(cpfNorm)) {
+        const motivo = 'CPF inválido';
+        errors.push({ linha, motivo, dados: record });
+        incErr(motivo);
+        continue;
+      }
+
+      // 1) titular salvo no upload?
+      const titularId = titularesMap.get(String(matriculaTitular));
+      if (!titularId) {
+        // 2) se não, verifique se o titular foi rejeitado e traga motivo/linha
+        const rejeitado = titularesRejeitados.get(String(matriculaTitular));
+        const motivo = rejeitado
+          ? `Titular ${matriculaTitular} rejeitado no upload (linha ${rejeitado.linha}): ${rejeitado.motivo}`
+          : `Titular com matrícula ${String(matriculaTitular)} não encontrado.`;
+        errors.push({ linha, motivo, dados: record });
+        incErr(rejeitado ? 'Titular rejeitado' : 'Titular não encontrado');
+        continue;
+      }
+
+      const dataEntrada = excelSerialDateToJSDate(
+        Number(getField(record, COLUMN_MAP.dataInicio)),
+      );
+      if (!dataEntrada) {
+        const motivo = 'Data de entrada inválida';
+        errors.push({ linha, motivo, dados: record });
+        incErr(motivo);
+        continue;
+      }
+
+      // Dependente pode não ter data de nascimento na planilha; o preço por faixa usa faixa da planilha (se houver)
+      const faixaPlanilha =
+        String(getField(record, COLUMN_MAP.faixaEtaria) ?? '').trim() || undefined;
+
+      const { price } = await this.lookupCorrectPrice(this.prisma, {
+        clientId,
+        planoRaw: getField(record, COLUMN_MAP.plano),
+        dataEntrada,
+        faixaEtaria: faixaPlanilha ?? null,
+      });
+
+      const valorFromSheet = toNumberLoose(getField(record, COLUMN_MAP.valorMensalidade));
+      const valorFinal = price ?? valorFromSheet;
+
+      const baseUnchecked: Prisma.BeneficiarioUncheckedCreateInput = {
+        clientId,
+        titularId,
+        nomeCompleto: String(nome).trim(),
+        cpf: cpfNorm,
+        tipo: tipoCsv,
+        dataEntrada,
+        status: BeneficiarioStatus.ATIVO,
+        valorMensalidade: valorFinal,
+        matricula: String(matriculaTitular),
+        carteirinha: String(getField(record, COLUMN_MAP.carteirinha) ?? ''),
+        sexo: normalizeSexo(getField(record, COLUMN_MAP.sexo)) ?? undefined,
+        plano: String(getField(record, COLUMN_MAP.plano) ?? '') || undefined,
+      };
+
+      const existing = await this.prisma.beneficiario.findUnique({
+        where: { clientId_cpf: { clientId, cpf: cpfNorm } },
+      });
+
+      await this.prisma.beneficiario.upsert({
+        where: { clientId_cpf: { clientId, cpf: cpfNorm } },
+        update: { ...baseUnchecked, clientId: undefined },
+        create: { ...baseUnchecked },
+      });
+
+      if (existing) {
+        updated++;
+        updatedDependentes++;
+      } else {
+        created++;
+        createdDependentes++;
+      }
+    }
+
+    // Salva os erros no banco (se houver)
+    if (errors.length > 0) {
+      await this.prisma.beneficiarioImportError.createMany({
+        data: errors.map((err) => ({
           clientId,
-          nomeCompleto: String(nome).trim(),
-          cpf: cpfNorm,
-          tipo: BeneficiarioTipo.TITULAR,
-          dataEntrada,
-          status: BeneficiarioStatus.ATIVO,
-          valorMensalidade: toNumberLoose(getField(record, COLUMN_MAP.valorMensalidade)),
-          matricula: String(matricula),
-          carteirinha: String(getField(record, COLUMN_MAP.carteirinha) ?? ''),
-          sexo: normalizeSexo(getField(record, COLUMN_MAP.sexo)) ?? undefined,
-          dataNascimento: dataNasc ?? undefined,
-          plano: String(getField(record, COLUMN_MAP.plano) ?? '') || undefined,
-          centroCusto: String(getField(record, COLUMN_MAP.centroCusto) ?? '') || undefined,
-          faixaEtaria: faixaFinal ?? undefined,
-          estado: String(getField(record, COLUMN_MAP.estado) ?? '') || undefined,
-          contrato: String(getField(record, COLUMN_MAP.contrato) ?? '') || undefined,
-          comentario: String(getField(record, COLUMN_MAP.comentario) ?? '') || undefined,
-        };
-
-        const existing = await tx.beneficiario.findUnique({
-          where: { clientId_cpf: { clientId, cpf: cpfNorm } },
-        });
-
-        const upsertedTitular = await tx.beneficiario.upsert({
-          where: { clientId_cpf: { clientId, cpf: cpfNorm } },
-          update: {
-            ...baseUnchecked,
-            clientId: undefined, // não altere o clientId em updates
-          },
-          create: { ...baseUnchecked },
-        });
-
-        if (existing) {
-          updated++; updatedTitulares++;
-        } else {
-          created++; createdTitulares++;
-        }
-
-        // matrícula -> id salvo
-        titularesMap.set(String(matricula), upsertedTitular.id);
-      }
-
-      // ================= DEPENDENTES =================
-      for (const [index, record] of records.entries()) {
-        const tipoCsv = mapParentescoToTipo(getField(record, COLUMN_MAP.parentesco));
-        if (!tipoCsv || tipoCsv === BeneficiarioTipo.TITULAR) continue;
-
-        const linha = index + 2;
-        const nome = getField(record, COLUMN_MAP.nome);
-        const cpfRaw = getField(record, COLUMN_MAP.cpf);
-        const matriculaTitular = getField(record, COLUMN_MAP.matricula);
-
-        if (!nome || !cpfRaw || !matriculaTitular) {
-          const motivo = 'Campos obrigatórios ausentes';
-          errors.push({ linha, motivo, dados: record });
-          incErr(motivo);
-          continue;
-        }
-
-        const cpfNorm = normalizeCpf(cpfRaw);
-        if (!cpfNorm || !isValidCpf(cpfNorm)) {
-          const motivo = 'CPF inválido';
-          errors.push({ linha, motivo, dados: record });
-          incErr(motivo);
-          continue;
-        }
-
-        // 1) titular salvo no upload?
-        const titularId = titularesMap.get(String(matriculaTitular));
-        if (!titularId) {
-          // 2) se não, verifique se o titular foi rejeitado e traga motivo/linha
-          const rejeitado = titularesRejeitados.get(String(matriculaTitular));
-          const motivo = rejeitado
-            ? `Titular ${matriculaTitular} rejeitado no upload (linha ${rejeitado.linha}): ${rejeitado.motivo}`
-            : `Titular com matrícula ${String(matriculaTitular)} não encontrado.`;
-          errors.push({ linha, motivo, dados: record });
-          incErr(rejeitado ? 'Titular rejeitado' : 'Titular não encontrado');
-          continue;
-        }
-
-        const dataEntrada = excelSerialDateToJSDate(Number(getField(record, COLUMN_MAP.dataInicio)));
-        if (!dataEntrada) {
-          const motivo = 'Data de entrada inválida';
-          errors.push({ linha, motivo, dados: record });
-          incErr(motivo);
-          continue;
-        }
-
-        const baseUnchecked: Prisma.BeneficiarioUncheckedCreateInput = {
-          clientId,
-          titularId,
-          nomeCompleto: String(nome).trim(),
-          cpf: cpfNorm,
-          tipo: tipoCsv,
-          dataEntrada,
-          status: BeneficiarioStatus.ATIVO,
-          valorMensalidade: toNumberLoose(getField(record, COLUMN_MAP.valorMensalidade)),
-          matricula: String(matriculaTitular),
-          carteirinha: String(getField(record, COLUMN_MAP.carteirinha) ?? ''),
-          sexo: normalizeSexo(getField(record, COLUMN_MAP.sexo)) ?? undefined,
-          plano: String(getField(record, COLUMN_MAP.plano) ?? '') || undefined,
-        };
-
-        const existing = await tx.beneficiario.findUnique({
-          where: { clientId_cpf: { clientId, cpf: cpfNorm } },
-        });
-
-        await tx.beneficiario.upsert({
-          where: { clientId_cpf: { clientId, cpf: cpfNorm } },
-          update: { ...baseUnchecked, clientId: undefined },
-          create: { ...baseUnchecked },
-        });
-
-        if (existing) {
-          updated++; updatedDependentes++;
-        } else {
-          created++; createdDependentes++;
-        }
-      }
-
-      // Salva os erros no banco (se houver)
-      if (errors.length > 0) {
-        await tx.beneficiarioImportError.createMany({
-          data: errors.map((err) => ({
-            clientId,
-            linha: err.linha,
-            motivo: err.motivo,
-            dados: err.dados,
-          })),
-        });
-      }
-    });
+          linha: err.linha,
+          motivo: err.motivo,
+          dados: err.dados,
+        })),
+      });
+    }
 
     // monta resumo de erros
     const porMotivo = Array.from(errorCounts.entries())
@@ -563,14 +744,18 @@ async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
       include: { titular: { select: { id: true, nomeCompleto: true } } },
     });
     if (!beneficiary) {
-      throw new NotFoundException(`Beneficiário com ID ${beneficiaryId} não encontrado para este cliente.`);
+      throw new NotFoundException(
+        `Beneficiário com ID ${beneficiaryId} não encontrado para este cliente.`,
+      );
     }
     return beneficiary;
   }
 
   async update(clientId: string, beneficiaryId: string, dto: UpdateBeneficiaryDto) {
     if (dto.tipo && String(dto.tipo).toUpperCase() !== 'TITULAR' && !dto.titularId) {
-      throw new BadRequestException('Para dependentes (FILHO/CONJUGE), o ID do titular é obrigatório.');
+      throw new BadRequestException(
+        'Para dependentes (FILHO/CONJUGE), o ID do titular é obrigatório.',
+      );
     }
 
     const dataNasc = dto.dataNascimento ? new Date(dto.dataNascimento) : undefined;
@@ -584,7 +769,9 @@ async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
     const data: Prisma.BeneficiarioUpdateInput = {
       nomeCompleto: dto.nomeCompleto,
       cpf: cpfNorm,
-      tipo: dto.tipo ? (String(dto.tipo).toUpperCase() as keyof typeof BeneficiarioTipo) as BeneficiarioTipo : undefined,
+      tipo: dto.tipo
+        ? ((String(dto.tipo).toUpperCase() as keyof typeof BeneficiarioTipo) as BeneficiarioTipo)
+        : undefined,
       dataEntrada: dto.dataEntrada ? new Date(dto.dataEntrada) : undefined,
       status: dto.status,
       dataSaida: dto.dataSaida ? new Date(dto.dataSaida) : undefined,
@@ -598,7 +785,8 @@ async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
       estado: dto.estado ?? undefined,
       contrato: dto.contrato ?? undefined,
       comentario: dto.comentario ?? undefined,
-      valorMensalidade: dto.valorMensalidade != null ? toNumberLoose(dto.valorMensalidade) : undefined,
+      valorMensalidade:
+        dto.valorMensalidade != null ? toNumberLoose(dto.valorMensalidade) : undefined,
       regimeCobranca: (dto.regimeCobranca as RegimeCobranca) ?? undefined,
       motivoMovimento: (dto.motivoMovimento as MotivoMovimento) ?? undefined,
       observacoes: dto.observacoes ?? undefined,
@@ -611,7 +799,9 @@ async findMany(clientId: string, query: FindBeneficiariesQueryDto) {
         where: { id: dto.titularId, clientId, tipo: BeneficiarioTipo.TITULAR },
       });
       if (!titularExists) {
-        throw new BadRequestException(`Titular com ID ${dto.titularId} não encontrado para este cliente.`);
+        throw new BadRequestException(
+          `Titular com ID ${dto.titularId} não encontrado para este cliente.`,
+        );
       }
       data.titular = { connect: { id: dto.titularId } };
     }

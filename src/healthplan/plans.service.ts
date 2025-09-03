@@ -17,7 +17,13 @@ export class PlansService {
   async createPlan(dto: CreatePlanDto) {
     const exists = await this.prisma.healthPlan.findUnique({ where: { slug: dto.slug } });
     if (exists) throw new BadRequestException('Slug já cadastrado.');
-    return this.prisma.healthPlan.create({ data: { ...dto } });
+    return this.prisma.healthPlan.create({
+      data: {
+        slug: dto.slug,
+        name: dto.name,
+        isActive: dto.isActive ?? true,
+      },
+    });
   }
 
   async listPlans() {
@@ -34,7 +40,13 @@ export class PlansService {
 
   async updatePlan(planId: string, dto: UpdatePlanDto) {
     await this.getPlan(planId);
-    return this.prisma.healthPlan.update({ where: { id: planId }, data: dto });
+    return this.prisma.healthPlan.update({
+      where: { id: planId },
+      data: {
+        ...(dto.name !== undefined ? { name: dto.name } : {}),
+        ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
+      },
+    });
   }
 
   async deletePlan(planId: string) {

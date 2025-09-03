@@ -1,22 +1,16 @@
-import {
-  Injectable,
-  BadRequestException,
-} from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import * as Papa from 'papaparse';
 import * as xlsx from 'xlsx';
-import {
-  listImportedInvoicesDTO,
-} from './dto/invoices.dto';
+import { listImportedInvoicesDTO, reconcileInvoicesDTO } from './dto/invoices.dto';
 
 /**
  * Serviço de importação/consulta de faturas.
  * - Lê CSV/XLS/XLSX
  * - Normaliza cabeçalhos (sem acento/espacos)
  * - Converte valores monetários de forma resiliente
- * - (NOVO) Filtra por coluna "credencial" mantendo apenas linhas cujo prefixo (5 chars) é "0TATM"
- *   -> permite separar Saúde (0TATM) de Dental (ex.: 0TAYS)
- * - Grava em "health_imported_invoices" (tabela FaturaImportada), modelo de 1 linha por beneficiário
+ * - Filtra por coluna "credencial" mantendo apenas linhas cujo prefixo é "0TATM"
+ * - Grava em "health_imported_invoices" (tabela FaturaImportada), 1 linha/beneficiário
  */
 @Injectable()
 export class InvoicesService {
@@ -135,15 +129,11 @@ export class InvoicesService {
     return (v || '').replace(/\D/g, '').slice(0, 11);
   }
 
-  private toBRL(n: number) {
-    return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-  }
-
   /* ------------------------------- main ------------------------------------ */
 
   /**
    * Importa arquivo e grava em FaturaImportada (1 linha/beneficiário).
-   * (NOVO) Filtra por credencial começando com 0TATM (5 primeiros caracteres).
+   * Filtra por credencial começando com 0TATM, economizando memória.
    */
   async processInvoiceUpload(clientId: string, file: Express.Multer.File) {
     if (!file) throw new BadRequestException('Nenhum arquivo enviado.');
@@ -224,39 +214,135 @@ export class InvoicesService {
       return undefined;
     };
 
-    // leitura
-    let rows: any[] = [];
+    const REQUIRED_PREFIX = (process.env.INVOICE_CREDENTIAL_PREFIX || '0TATM').toUpperCase();
+
+    // queremos só essas chaves para reduzir custo de normalização
+    const NEEDED_KEYS = new Set([
+      ...NAME_ALIASES,
+      ...CPF_ALIASES,
+      ...VALOR_ALIASES,
+      ...CREDENCIAL_ALIASES,
+    ]);
+
+    const normalizeNeeded = (obj: Record<string, any>) => {
+      const out: Record<string, any> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        const nk = this.normalizeKey(k);
+        if (NEEDED_KEYS.has(nk)) out[nk] = v;
+      }
+      return out;
+    };
+
+    const matchesCredential = (rec: Record<string, any>) => {
+      const cred = pick(rec, CREDENCIAL_ALIASES);
+      if (!cred) return false;
+      const prefix = String(cred).trim().toUpperCase();
+      return prefix.startsWith(REQUIRED_PREFIX);
+    };
+
+    // leitura + filtro imediato
+    let kept: Record<string, any>[] = [];
+    let totalRows = 0;
 
     try {
       if (isCsv && !isExcel) {
-        const { text: fullRaw, encoding } = this.decodeSmart(file.buffer);
+        const { text: fullRaw } = this.decodeSmart(file.buffer);
         const contentFull = this.stripBom(fullRaw);
 
         const allLines = contentFull.split(/\r?\n/);
         const headerIndex = this.findHeaderIndex(allLines);
         const content = allLines.slice(headerIndex).join('\n');
 
-        const firstLine =
-          content.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
+        const firstLine = content.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
         const delimiter = this.detectDelimiter(firstLine);
 
-        const parsed = Papa.parse(content, {
+        // filtra durante o parsing (não materializa tudo)
+        Papa.parse(content, {
           header: true,
           skipEmptyLines: true,
           delimiter,
           dynamicTyping: false,
+          step: (row: Papa.ParseStepResult<any>) => {
+            const rec = normalizeNeeded(row.data as Record<string, any>);
+            if (!Object.keys(rec).length) return;
+            totalRows++;
+            if (matchesCredential(rec)) kept.push(rec);
+          },
         });
-
-        rows = (parsed.data as any[]).filter((r) => r && Object.keys(r).length);
-
-        console.log('[Invoices] CSV', { encoding, headerIndex, delimiter, count: rows.length });
-        console.log('[Invoices] headers(raw):', Object.keys(rows[0] || {}));
       } else if (isExcel) {
         const wb = xlsx.read(file.buffer, { type: 'buffer' });
         const sheet = wb.Sheets[wb.SheetNames[0]];
-        rows = xlsx.utils.sheet_to_json(sheet ?? {}, { defval: '' });
-        console.log('[Invoices] XLS/XLSX', { sheet: wb.SheetNames[0], count: rows.length });
-        console.log('[Invoices] headers(raw):', Object.keys(rows[0] || {}));
+        if (!sheet) throw new BadRequestException('Planilha vazia.');
+
+        const ref = String(sheet['!ref'] || '');
+        if (!ref) throw new BadRequestException('Intervalo da planilha não encontrado.');
+        const range = xlsx.utils.decode_range(ref);
+
+        // detecta a linha de header (heurística semelhante ao CSV)
+        const norm = (t: any) =>
+          String(t ?? '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const tokens = [
+          'cpf',
+          'beneficiario',
+          'beneficiário',
+          'nome',
+          'mensalidade',
+          'valor',
+          'credencial',
+          'carteirinha',
+          'cobrado',
+        ];
+        let headerRow = range.s.r;
+        let bestScore = -1;
+
+        for (let r = range.s.r; r <= Math.min(range.e.r, range.s.r + 80); r++) {
+          let rowStr = '';
+          for (let c = range.s.c; c <= range.e.c; c++) {
+            const cell = sheet[xlsx.utils.encode_cell({ r, c })];
+            if (cell?.v != null) rowStr += ' ' + cell.v;
+          }
+          const s = norm(rowStr);
+          const score = tokens.reduce((acc, t) => acc + (s.includes(t) ? 1 : 0), 0);
+          if (score > bestScore) {
+            bestScore = score;
+            headerRow = r;
+          }
+          if (score >= 3) break;
+        }
+
+        // headers normalizados por coluna (de s.c..e.c)
+        const headers: string[] = [];
+        for (let c = range.s.c; c <= range.e.c; c++) {
+          const cell = sheet[xlsx.utils.encode_cell({ r: headerRow, c })];
+          headers.push(this.normalizeKey(String(cell?.v ?? '')));
+        }
+
+        // mapeia apenas colunas de interesse
+        const colToKey = new Map<number, string>();
+        for (let idx = 0; idx < headers.length; idx++) {
+          const key = headers[idx];
+          if (NEEDED_KEYS.has(key)) colToKey.set(idx, key);
+        }
+
+        // varre linhas abaixo do header
+        for (let r = headerRow + 1; r <= range.e.r; r++) {
+          const rec: Record<string, any> = {};
+          let hasAny = false;
+
+          for (const [idx, key] of colToKey.entries()) {
+            const c = range.s.c + idx;
+            const cell = sheet[xlsx.utils.encode_cell({ r, c })];
+            const v = cell?.v;
+            if (v !== undefined && v !== null && String(v).trim() !== '') {
+              rec[key] = v;
+              hasAny = true;
+            }
+          }
+
+          if (!hasAny) continue;
+          totalRows++;
+          if (matchesCredential(rec)) kept.push(rec);
+        }
       } else {
         throw new BadRequestException(
           `Tipo de arquivo não suportado: ${file.mimetype} (${file.originalname})`,
@@ -264,39 +350,16 @@ export class InvoicesService {
       }
     } catch (err) {
       console.error('Erro ao ler arquivo:', err);
-      throw new BadRequestException(
-        'Falha ao ler o arquivo. Verifique o formato e o layout.',
-      );
+      throw new BadRequestException('Falha ao ler o arquivo. Verifique o formato e o layout.');
     }
 
-    // normaliza chaves
-    const normalized = rows.map((r) => {
-      const out: Record<string, any> = {};
-      for (const [k, v] of Object.entries(r)) out[this.normalizeKey(k)] = v;
-      return out;
-    });
+    const dropped = Math.max(0, totalRows - kept.length);
 
-    const normFirst = normalized[0] || {};
-    console.log('[Invoices] headers(normalized):', Object.keys(normFirst));
-
-    // (NOVO) filtro por credencial prefixada — **somente mantém quem COMEÇA com o prefixo**
-    const REQUIRED_PREFIX = (process.env.INVOICE_CREDENTIAL_PREFIX || '0TATM').toUpperCase();
-    const kept = normalized.filter((rec) => {
-      const cred = pick(rec, CREDENCIAL_ALIASES);
-      // regra: se não houver credencial => DESCARTA
-      if (!cred) return false;
-      const prefix5 = String(cred).trim().toUpperCase().slice(0, 5);
-      return prefix5 === REQUIRED_PREFIX;
-    });
-
-    const dropped = normalized.length - kept.length;
-    console.log(
-      `[Invoices] Filtradas por credencial prefix=${REQUIRED_PREFIX} -> mantidas=${kept.length}, descartadas=${dropped}`,
-    );
-
-    // mês de referência = 1º dia UTC do mês atual (ajuste se precisar ler do arquivo)
+    // mês de referência = 1º dia UTC do mês atual
     const now = new Date();
-    const mesReferencia = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+    const mesReferencia = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0),
+    );
 
     // gravação
     let processedCount = 0;
@@ -306,9 +369,18 @@ export class InvoicesService {
       await tx.faturaImportada.deleteMany({ where: { clientId, mesReferencia } });
 
       for (const rec of kept) {
-        const nome = pick(rec, NAME_ALIASES);
-        const cpfRaw = pick(rec, CPF_ALIASES);
-        const valorRaw = pick(rec, VALOR_ALIASES);
+        const nome = ((): any => {
+          for (const a of NAME_ALIASES) if (rec[a] != null && String(rec[a]).trim() !== '') return rec[a];
+          return undefined;
+        })();
+        const cpfRaw = ((): any => {
+          for (const a of CPF_ALIASES) if (rec[a] != null && String(rec[a]).trim() !== '') return rec[a];
+          return undefined;
+        })();
+        const valorRaw = ((): any => {
+          for (const a of VALOR_ALIASES) if (rec[a] != null && String(rec[a]).trim() !== '') return rec[a];
+          return undefined;
+        })();
 
         if (!cpfRaw) continue;
 
@@ -328,7 +400,9 @@ export class InvoicesService {
             cpfBeneficiarioOperadora: cpf,
             valorCobradoOperadora: valor === null || Number.isNaN(valor) ? null : valor,
             statusConciliacao: 'pendente',
-            raw: rec, // mantemos linha crua para auditoria
+            // Para reduzir ainda mais, você pode gravar apenas { credencial }:
+            // raw: { credencial: pick(rec, CREDENCIAL_ALIASES) ?? null },
+            raw: rec,
           },
         });
 
@@ -337,12 +411,12 @@ export class InvoicesService {
     });
 
     const detect = (aliases: string[]) =>
-      aliases.find((a) => normFirst[a] !== undefined) ?? null;
+      kept[0] ? aliases.find((a) => kept[0][a] !== undefined) ?? null : null;
 
     return {
       message: 'Fatura importada com sucesso.',
       processedRows: processedCount,
-      totalRows: rows.length,
+      totalRows,
       filteredOutByCredential: dropped,
       credentialPrefix: REQUIRED_PREFIX,
       detectedColumns: {
@@ -365,7 +439,9 @@ export class InvoicesService {
     { mes, page = 1, limit = 100, search }: listImportedInvoicesDTO,
   ) {
     const today = new Date();
-    const ym = mes || `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, '0')}`;
+    const ym =
+      mes ||
+      `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, '0')}`;
 
     const [year, month] = ym.split('-').map(Number);
     const startDate = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
@@ -377,7 +453,12 @@ export class InvoicesService {
       ...(search
         ? {
             OR: [
-              { nomeBeneficiarioOperadora: { contains: search, mode: 'insensitive' as const } },
+              {
+                nomeBeneficiarioOperadora: {
+                  contains: search,
+                  mode: 'insensitive' as const,
+                },
+              },
               { cpfBeneficiarioOperadora: { contains: search.replace(/\D/g, '') } },
             ],
           }
@@ -434,5 +515,19 @@ export class InvoicesService {
       message: `${result.count} faturas foram conciliadas com sucesso.`,
       reconciledCount: result.count,
     };
+  }
+
+  /**
+   * Wrapper para compatibilidade com o controller novo.
+   * - Se vier invoiceIds => delega para reconcileByIds (legado).
+   * - Caso contrário, lança erro (fechamento/evolução ficam no ReconciliationService).
+   */
+  async reconcile(clientId: string, body: reconcileInvoicesDTO) {
+    if (Array.isArray(body?.invoiceIds) && body.invoiceIds.length > 0) {
+      return this.reconcileByIds(clientId, body.invoiceIds);
+    }
+    throw new BadRequestException(
+      'Nada para reconciliar. Informe "invoiceIds" ou use os endpoints de conciliação/fechamento.',
+    );
   }
 }

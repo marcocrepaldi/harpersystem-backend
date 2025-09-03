@@ -19,6 +19,7 @@ import { ReconciliationModule } from './reconciliation/reconciliation.module';
 import { HealthPlanModule } from './healthplan/plans.module';
 import { ClientPlansModule } from './healthplan/client-plans.module';
 import { ImportErrorsModule } from './import-errors/import-errors.module';
+import { DocumentsModule } from './documents/documents.module';
 
 @Module({
   imports: [
@@ -37,7 +38,8 @@ import { ImportErrorsModule } from './import-errors/import-errors.module';
     ReconciliationModule,
     HealthPlanModule,
     ClientPlansModule,
-    ImportErrorsModule
+    ImportErrorsModule,
+    DocumentsModule
   ],
   controllers: [AppController],
   providers: [

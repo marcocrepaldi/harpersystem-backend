@@ -1,3 +1,4 @@
+// src/beneficiaries/beneficiaries.controller.ts
 import {
   Controller,
   Get,
@@ -9,8 +10,6 @@ import {
   Body,
   UseInterceptors,
   UploadedFile,
-  ParseFilePipe,
-  MaxFileSizeValidator,
   HttpCode,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
@@ -32,27 +31,20 @@ export class BeneficiariesController {
     @Param('clientId', ParseCuidPipe) clientId: string,
     @Query() query: FindBeneficiariesQueryDto,
   ) {
-    // Se nenhum parâmetro de paginação (page ou limit) for enviado,
-    // garantimos que a busca retorne todos os registros.
     const queryWithAll = { ...query, all: true };
     return this.beneficiariesService.findMany(clientId, queryWithAll);
   }
 
   /**
    * Importação em massa (CSV/XLS/XLSX).
-   * Validação de tamanho; o service lida com tipo/parse.
+   * Sem validação de tamanho/tipo no controller.
    */
   @Post('upload')
   @HttpCode(200)
   @UseInterceptors(FileInterceptor('file'))
   async uploadFile(
     @Param('clientId', ParseCuidPipe) clientId: string,
-    @UploadedFile(
-      new ParseFilePipe({
-        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })],
-      }),
-    )
-    file: Express.Multer.File,
+    @UploadedFile() file: Express.Multer.File,
   ) {
     return this.beneficiariesService.processUpload(clientId, file);
   }

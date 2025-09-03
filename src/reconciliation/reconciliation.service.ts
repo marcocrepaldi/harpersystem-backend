@@ -31,7 +31,6 @@ type ReconciliationPayload = {
   clientId: string;
   mesReferencia: string; // YYYY-MM-01
   totals: {
-    // contagens
     faturaCount: number;
     ativosCount: number;
     onlyInInvoice: number;
@@ -40,13 +39,18 @@ type ReconciliationPayload = {
     duplicates: number;
     okCount: number;
 
-    // financeiros (formatados em BRL)
-    faturaSum: string;         // soma de tudo que veio na fatura
-    okSum: string;             // soma das linhas OK (convergentes)
-    onlyInInvoiceSum: string;  // soma do que está "só na fatura"
+    faturaSum: string;
+    okSum: string;
+    onlyInInvoiceSum: string;
   };
   filtersApplied: Filters;
   tabs: ReconTabs;
+  closure?: {
+    status: 'OPEN' | 'CLOSED';
+    totalFatura?: string;
+    closedAt?: string;
+    notes?: string | null;
+  };
 };
 
 type FaturaRow = {
@@ -84,38 +88,21 @@ export class ReconciliationService {
     return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 0, 0, 0));
   }
 
-  /**
-   * Converte valores monetários vindos como:
-   * - number                      -> 297.81
-   * - "297.81" / "2.978,10"       -> 297.81
-   * - "R$ 297,81"                 -> 297.81
-   * - "29781" (centavos)          -> 297.81
-   */
   private toNum(v: unknown): number {
     if (v == null) return 0;
     if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
-
     const original = String(v).trim();
     if (!original) return 0;
-
     const raw = original.replace(/[^\d.,\-]/g, '');
-
     let n = 0;
-    if (raw.includes(',')) {
-      // pt-BR
-      const cleaned = raw.replace(/\./g, '').replace(',', '.');
-      n = Number(cleaned);
-    } else if (raw.includes('.')) {
-      n = Number(raw);
-    } else {
+    if (raw.includes(',')) n = Number(raw.replace(/\./g, '').replace(',', '.'));
+    else if (raw.includes('.')) n = Number(raw);
+    else {
       const asInt = Number(raw);
       n = Number.isInteger(asInt) && raw.length >= 3 ? asInt / 100 : asInt;
     }
-
-    if (!Number.isFinite(n)) return 0;
-    return n;
+    return Number.isFinite(n) ? n : 0;
   }
-
   private toBRL(n: number) {
     return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
   }
@@ -124,12 +111,10 @@ export class ReconciliationService {
     return `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9, 11)}`;
   }
 
-  // where de beneficiários **vigentes no mês**
   private makeBenefWhereVigente(clientId: string, filters: Filters, start: Date, next: Date) {
     const where: Prisma.BeneficiarioWhereInput = {
       clientId,
       status: 'ATIVO',
-      // vigente no mês de referência:
       dataEntrada: { lt: next },
       OR: [{ dataSaida: null }, { dataSaida: { gte: start } }],
     };
@@ -172,13 +157,13 @@ export class ReconciliationService {
     if (!client) throw new NotFoundException('Cliente não encontrado.');
 
     const ym = this.ensureYYYYMM(opts?.mesReferencia);
-    const firstDayStr = this.toYYYYMM01(ym); // para SQL
+    const firstDayStr = this.toYYYYMM01(ym);
     const start = this.firstDayUTC(ym);
     const next = this.nextMonthUTC(start);
     const filters = opts?.filters ?? {};
     const anyFilter = !!(filters.tipo || filters.plano || filters.centro);
 
-    // 1) tenta ITENS
+    // 1) tenta itens
     let rows = await this.prisma.$queryRaw<FaturaRow[]>(Prisma.sql`
       SELECT i."id", i."nomeCompleto", i."cpf", i."valorPlano"
       FROM "health_imported_invoice_items" i
@@ -188,7 +173,7 @@ export class ReconciliationService {
         AND f."mesReferencia" < (${firstDayStr}::date + INTERVAL '1 month')
     `);
 
-    // 2) fallback: cabeçalho (1 linha/beneficiário)
+    // 2) fallback: cabeçalho
     if (rows.length === 0) {
       rows = await this.prisma.$queryRaw<FaturaRow[]>(Prisma.sql`
         SELECT f."id",
@@ -210,11 +195,10 @@ export class ReconciliationService {
       })
       .filter(Boolean) as Array<{ id: string; cpf: string; nome: string; valor: number }>;
 
-    // totais brutos de fatura (todos os itens)
     const faturaCount = flatFatura.length;
     const faturaSumNumber = flatFatura.reduce((acc, r) => acc + r.valor, 0);
 
-    // ✅ Beneficiários **vigentes** no mês de referência
+    // Beneficiários vigentes
     const ativos = await this.prisma.beneficiario.findMany({
       where: this.makeBenefWhereVigente(clientId, filters, start, next),
       select: { id: true, nomeCompleto: true, cpf: true, valorMensalidade: true },
@@ -228,7 +212,7 @@ export class ReconciliationService {
     }
     const ativosSet = new Set(mapAtivos.keys());
 
-    // agrega fatura por CPF (p/ detectar duplicados e somar cobranças por beneficiário)
+    // agrega a fatura por CPF
     const byCpf = new Map<string, { nome: string; soma: number; valores: number[]; ids: string[] }>();
     for (const r of flatFatura) {
       const cur = byCpf.get(r.cpf) ?? { nome: r.nome, soma: 0, valores: [], ids: [] };
@@ -246,7 +230,7 @@ export class ReconciliationService {
     const duplicates: ReconTabs['duplicates'] = [];
     const allInvoice: ReconTabs['allInvoice'] = [];
 
-    // acumuladores financeiros para cards
+    // acumuladores
     let onlyInInvoiceSumNum = 0;
     let okSumNum = 0;
     let okCount = 0;
@@ -256,7 +240,6 @@ export class ReconciliationService {
       const ativo = mapAtivos.get(cpf);
 
       if (!ativo) {
-        // Só na fatura (não mostra quando há filtro por vigência/plano/tipo/centro)
         if (!anyFilter) {
           onlyInInvoice.push({
             id: info.ids[0] ?? `INV:${cpf}`,
@@ -291,13 +274,12 @@ export class ReconciliationService {
           diferenca: this.toBRL(info.soma - ativo.mensalidade),
         });
       } else {
-        // Convergente (OK) por CPF somado
         okSumNum += info.soma;
         okCount += 1;
       }
     }
 
-    // Só no cadastro (vigente sem linha de fatura)
+    // Só no cadastro
     for (const [cpf, ativo] of mapAtivos.entries()) {
       if (!byCpf.has(cpf)) {
         onlyInRegistry.push({
@@ -309,7 +291,7 @@ export class ReconciliationService {
       }
     }
 
-    // Monta a visão "Fatura (todos)" linha-a-linha
+    // Monta a visão "Fatura (todos)"
     for (const r of flatFatura) {
       if (anyFilter && !ativosSet.has(r.cpf)) continue;
       const ativo = mapAtivos.get(r.cpf);
@@ -336,7 +318,7 @@ export class ReconciliationService {
       });
     }
 
-    // ordenações estáveis
+    // ordenações
     const byNome = <T extends { nome: string }>(a: T, b: T) => a.nome.localeCompare(b.nome);
     onlyInInvoice.sort(byNome);
     onlyInRegistry.sort(byNome);
@@ -344,12 +326,36 @@ export class ReconciliationService {
     duplicates.sort(byNome);
     allInvoice.sort(byNome);
 
+    // status de fechamento
+    const existingClosure = await this.prisma.conciliacao.findUnique({
+      where: { clientId_mesReferencia: { clientId, mesReferencia: start } },
+      select: { status: true, totals: true, closedAt: true },
+    });
+
+    const declaredTotal =
+      existingClosure && typeof (existingClosure.totals as any)?.declaredTotal === 'number'
+        ? (existingClosure.totals as any).declaredTotal
+        : undefined;
+
+    const closure: ReconciliationPayload['closure'] | undefined =
+      existingClosure
+        ? {
+            status: existingClosure.status === 'FECHADA' ? 'CLOSED' : 'OPEN',
+            totalFatura:
+              typeof declaredTotal === 'number' ? this.toBRL(declaredTotal) : undefined,
+            closedAt: existingClosure.closedAt?.toISOString(),
+            notes:
+              typeof (existingClosure.totals as any)?.notes === 'string'
+                ? (existingClosure.totals as any).notes
+                : null,
+          }
+        : undefined;
+
     return {
       ok: true,
       clientId,
       mesReferencia: this.toYYYYMM01(ym),
       totals: {
-        // contagens
         faturaCount,
         ativosCount: mapAtivos.size,
         onlyInInvoice: onlyInInvoice.length,
@@ -357,18 +363,17 @@ export class ReconciliationService {
         mismatched: mismatched.length,
         duplicates: duplicates.length,
         okCount,
-
-        // financeiros
         faturaSum: this.toBRL(faturaSumNumber),
         okSum: this.toBRL(okSumNum),
         onlyInInvoiceSum: this.toBRL(onlyInInvoiceSumNum),
       },
       filtersApplied: filters,
       tabs: { onlyInInvoice, onlyInRegistry, mismatched, duplicates, allInvoice },
+      closure,
     };
   }
 
-  // ---------- export ----------
+  // ---------- export das abas ----------
   async exportReconciliation(
     clientId: string,
     opts: {
@@ -470,6 +475,312 @@ export class ReconciliationService {
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'csv' });
     return {
       filename: `reconciliacao_${opts.tab}_${clientId}_${yyyymm}${sheetNameSuffix()}.csv`,
+      contentType: 'text/csv; charset=utf-8',
+      buffer: buf as Buffer,
+    };
+  }
+
+  // ---------- Fechamento manual ----------
+  async closeManual(
+    clientId: string,
+    dto: { mes: string; totalFatura: number; observacoes?: string },
+    actorId?: string,
+  ) {
+    const ym = this.ensureYYYYMM(dto.mes);
+    const mesReferencia = this.firstDayUTC(ym);
+
+    // snapshot
+    const payload = await this.buildReconciliation(clientId, { mesReferencia: ym });
+
+    const totalsSnapshot: any = {
+      ...payload.totals,
+      declaredTotal: Number(dto.totalFatura) || 0,
+      notes: dto.observacoes ?? null,
+    };
+
+    const counts = {
+      faturaCount: payload.totals.faturaCount,
+      ativosCount: payload.totals.ativosCount,
+      mismatched: payload.totals.mismatched,
+      duplicates: payload.totals.duplicates,
+      onlyInInvoice: payload.totals.onlyInInvoice,
+      onlyInRegistry: payload.totals.onlyInRegistry,
+      okCount: payload.totals.okCount,
+    };
+
+    const conciliacao = await this.prisma.conciliacao.upsert({
+      where: { clientId_mesReferencia: { clientId, mesReferencia } },
+      create: {
+        clientId,
+        mesReferencia,
+        status: 'FECHADA',
+        totals: totalsSnapshot,
+        filtros: payload.filtersApplied as any,
+        counts: counts as any,
+        closedAt: new Date(),
+        closedBy: actorId ?? null,
+        createdBy: actorId ?? null,
+      },
+      update: {
+        status: 'FECHADA',
+        totals: totalsSnapshot,
+        filtros: payload.filtersApplied as any,
+        counts: counts as any,
+        closedAt: new Date(),
+        closedBy: actorId ?? undefined,
+      },
+      select: { id: true, status: true, closedAt: true },
+    });
+
+    return { ok: true, conciliacao };
+  }
+
+  // ---------- Reabrir mês ----------
+  async reopen(
+    clientId: string,
+    dto: { mes: string },
+    _actorId?: string,
+  ) {
+    const ym = this.ensureYYYYMM(dto.mes);
+    const mesReferencia = this.firstDayUTC(ym);
+
+    const conc = await this.prisma.conciliacao.findUnique({
+      where: { clientId_mesReferencia: { clientId, mesReferencia } },
+      select: { id: true },
+    });
+    if (!conc) throw new NotFoundException('Fechamento não encontrado para este mês.');
+
+    const updated = await this.prisma.conciliacao.update({
+      where: { id: conc.id },
+      data: { status: 'ABERTA', closedAt: null, closedBy: null },
+      select: { id: true, status: true },
+    });
+
+    return { ok: true, conciliacao: updated };
+  }
+
+  // ---------- Histórico (lista) ----------
+  async listHistory(
+    clientId: string,
+    opts?: {
+      fromYM?: string; // inclusive
+      toYM?: string;   // inclusive
+      page?: number;
+      limit?: number;
+      status?: 'OPEN' | 'CLOSED';
+      order?: 'asc' | 'desc';
+    },
+  ): Promise<{
+    ok: true;
+    clientId: string;
+    pagination: { page: number; limit: number; total: number; hasMore: boolean };
+    rows: Array<{
+      mes: string; // 'YYYY-MM'
+      status: 'OPEN' | 'CLOSED';
+      closedAt?: string | null;
+      totals: {
+        declarado?: string;
+        fatura?: string;
+        ok?: string;
+        onlyInInvoice?: string;
+      };
+      counts: {
+        faturaCount: number;
+        ativosCount: number;
+        mismatched: number;
+        duplicates: number;
+        onlyInInvoice: number;
+        onlyInRegistry: number;
+        okCount: number;
+      };
+      notes?: string | null;
+      signedBy?: { id: string; name?: string | null; email?: string | null };
+    }>;
+    summary: {
+      totalDeclarado: string;
+      totalFatura: string;
+      diferenca: string;
+      closedCount: number;
+      openCount: number;
+    };
+  }> {
+    const page = Math.max(1, opts?.page ?? 1);
+    const limit = Math.min(200, Math.max(1, opts?.limit ?? 24));
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.ConciliacaoWhereInput = { clientId };
+    // período
+    if (opts?.fromYM || opts?.toYM) {
+      const gte = opts?.fromYM ? this.firstDayUTC(opts.fromYM) : undefined;
+      const lte = opts?.toYM ? this.nextMonthUTC(this.firstDayUTC(opts.toYM)) : undefined;
+      where.mesReferencia = {
+        ...(gte ? { gte } : {}),
+        ...(lte ? { lt: lte } : {}),
+      };
+    }
+    // status
+    if (opts?.status) {
+      where.status = opts.status === 'CLOSED' ? 'FECHADA' : 'ABERTA';
+    }
+
+    const [total, rowsRaw] = await Promise.all([
+      this.prisma.conciliacao.count({ where }),
+      this.prisma.conciliacao.findMany({
+        where,
+        orderBy: { mesReferencia: opts?.order === 'asc' ? 'asc' : 'desc' },
+        select: {
+          mesReferencia: true,
+          status: true,
+          totals: true,
+          counts: true,
+          closedAt: true,
+          closedBy: true,
+        },
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    // nomes de quem fechou (se houver)
+    const closers = Array.from(new Set(rowsRaw.map(r => r.closedBy).filter(Boolean))) as string[];
+    const usersById = closers.length
+      ? (await this.prisma.user.findMany({
+          where: { id: { in: closers } },
+          select: { id: true, name: true, email: true },
+        })).reduce<Record<string, { id: string; name?: string | null; email?: string | null }>>(
+          (acc, u) => ((acc[u.id] = { id: u.id, name: u.name, email: u.email }), acc),
+          {},
+        )
+      : {};
+
+    let sumDeclarado = 0;
+    let sumFatura = 0;
+    let closedCount = 0;
+    let openCount = 0;
+
+    const rows = rowsRaw.map((r) => {
+      const ym = `${r.mesReferencia.getUTCFullYear()}-${String(
+        r.mesReferencia.getUTCMonth() + 1,
+      ).padStart(2, '0')}`;
+
+      const t = (r.totals ?? {}) as any;
+      const c = (r.counts ?? {}) as any;
+
+      const declaradoNum =
+        typeof t.declaredTotal === 'number' ? t.declaredTotal : this.toNum(t.declaredTotal);
+      const faturaNum = this.toNum(t.faturaSum);
+
+      if (Number.isFinite(declaradoNum)) sumDeclarado += declaradoNum;
+      if (Number.isFinite(faturaNum)) sumFatura += faturaNum;
+
+      if (r.status === 'FECHADA') closedCount += 1;
+      else openCount += 1;
+
+      // <- aqui garantimos literal type
+      const status: 'OPEN' | 'CLOSED' = r.status === 'FECHADA' ? 'CLOSED' : 'OPEN';
+
+      // força strings nos totais (ou undefined)
+      const declaradoStr = Number.isFinite(declaradoNum) ? this.toBRL(declaradoNum) : undefined;
+      const faturaStr = typeof t.faturaSum === 'string'
+        ? t.faturaSum
+        : (Number.isFinite(faturaNum) ? this.toBRL(faturaNum) : undefined);
+      const okStr = typeof t.okSum === 'string' ? t.okSum : undefined;
+      const onlyInvoiceStr = typeof t.onlyInInvoiceSum === 'string' ? t.onlyInInvoiceSum : undefined;
+
+      return {
+        mes: ym,
+        status,
+        closedAt: r.closedAt?.toISOString() ?? null,
+        totals: {
+          declarado: declaradoStr,
+          fatura: faturaStr,
+          ok: okStr,
+          onlyInInvoice: onlyInvoiceStr,
+        },
+        counts: {
+          faturaCount: c.faturaCount ?? 0,
+          ativosCount: c.ativosCount ?? 0,
+          mismatched: c.mismatched ?? 0,
+          duplicates: c.duplicates ?? 0,
+          onlyInInvoice: c.onlyInInvoice ?? 0,
+          onlyInRegistry: c.onlyInRegistry ?? 0,
+          okCount: c.okCount ?? 0,
+        },
+        notes: typeof t.notes === 'string' ? t.notes : null,
+        signedBy: r.closedBy ? usersById[r.closedBy] : undefined,
+      };
+    });
+
+    return {
+      ok: true,
+      clientId,
+      pagination: { page, limit, total, hasMore: skip + rows.length < total },
+      rows,
+      summary: {
+        totalDeclarado: this.toBRL(sumDeclarado),
+        totalFatura: this.toBRL(sumFatura),
+        diferenca: this.toBRL(sumDeclarado - sumFatura),
+        closedCount,
+        openCount,
+      },
+    };
+  }
+
+  // ---------- Exportar histórico ----------
+  async exportHistory(
+    clientId: string,
+    opts: {
+      fromYM?: string;
+      toYM?: string;
+      status?: 'OPEN' | 'CLOSED';
+      format: 'xlsx' | 'csv';
+    },
+  ): Promise<{ filename: string; contentType: string; buffer: Buffer }> {
+    const all = await this.listHistory(clientId, {
+      fromYM: opts.fromYM,
+      toYM: opts.toYM,
+      status: opts.status,
+      page: 1,
+      limit: 1000,
+      order: 'asc',
+    });
+
+    const rows = all.rows.map((r) => ({
+      Mes: r.mes,
+      Status: r.status,
+      Declarado: r.totals.declarado ?? '',
+      Fatura: r.totals.fatura ?? '',
+      Diferenca:
+        r.totals.declarado && r.totals.fatura
+          ? this.toBRL(this.toNum(r.totals.declarado) - this.toNum(r.totals.fatura))
+          : '',
+      ItensImportados: r.counts.faturaCount,
+      BenefAtivos: r.counts.ativosCount,
+      Divergentes: r.counts.mismatched,
+      Duplicados: r.counts.duplicates,
+      SoNaFatura: r.counts.onlyInInvoice,
+      SoNoCadastro: r.counts.onlyInRegistry,
+      FechadoEm: r.closedAt ?? '',
+      AssinadoPor: r.signedBy?.name ?? r.signedBy?.email ?? '',
+      Observacoes: r.notes ?? '',
+    }));
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, 'Faturamento');
+
+    if (opts.format === 'xlsx') {
+      const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+      return {
+        filename: `faturamento_${clientId}_${opts.fromYM ?? ''}_${opts.toYM ?? ''}.xlsx`,
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        buffer: buf as Buffer,
+      };
+    }
+
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'csv' });
+    return {
+      filename: `faturamento_${clientId}_${opts.fromYM ?? ''}_${opts.toYM ?? ''}.csv`,
       contentType: 'text/csv; charset=utf-8',
       buffer: buf as Buffer,
     };

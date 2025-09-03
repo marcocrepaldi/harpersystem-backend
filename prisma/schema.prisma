@@ -46,7 +46,7 @@ enum BeneficiarioStatus {
   INATIVO
 }
 
-// 👇 NOVOS: para regras/pró-rata e movimentos
+// Regras / movimentos
 enum RegimeCobranca {
   MENSAL
   DIARIO
@@ -57,6 +57,37 @@ enum MotivoMovimento {
   EXCLUSAO
   ALTERACAO
   NENHUM
+}
+
+// Conciliação e comissões
+enum ConciliacaoStatus {
+  ABERTA
+  FECHADA
+  ESTORNADA
+}
+
+enum ComissaoStatus {
+  A_RECEBER
+  RECEBIDA
+  ESTORNADA
+}
+
+// ---- NOVO: categorias de documentos ----
+enum DocumentCategory {
+  APOLICE
+  PROPOSTA
+  CONTRATO
+  FATURA
+  ANEXO
+  ADITIVO
+  BOLETIMDEOCORRENCIA
+  AVISODESINISTRO
+  LAUDODEPERICIA
+  COMUNICADODEACIDENTE
+  COMPROVANTEDERESIDENCIA
+  RELATORIODEREGULACAO
+  DOCUMENTO
+  OUTRO
 }
 
 // ---------- CORE ----------
@@ -73,9 +104,13 @@ model Corretor {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  users    User[]
-  clients  Client[]
-  policies Policy[] @relation("PolicyCorretor")
+  users           User[]
+  clients         Client[]
+  policies        Policy[] @relation("PolicyCorretor")
+  commissionRules CommissionRule[] @relation("Corretor_CommissionRules")
+
+  // ---- NOVO: back-relation de documentos do corretor
+  documents       Document[]
 }
 
 model User {
@@ -94,7 +129,7 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([corretorId, email]) // e-mail único por tenant
+  @@unique([corretorId, email])
   @@index([corretorId])
   @@index([refreshTokenHash])
   @@index([email])
@@ -115,7 +150,7 @@ model Client {
   personType PersonType   @default(PF)
   status     ClientStatus @default(ACTIVE)
 
-  // LEGADO (a ser descontinuado após migração para tags normalizadas):
+  // LEGADO
   tags       String[]     @default([])
 
   // endereço (legado)
@@ -160,36 +195,42 @@ model Client {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  deletedAt DateTime? // <— Soft delete
+  deletedAt DateTime?
 
   policies       Policy[]          @relation("PolicyClient")
   beneficiarios  Beneficiario[]
   regrasCobranca RegraCobranca[]
   faturas        FaturaImportada[]
 
-  // NORMALIZAÇÃO (Fase A)
+  // NORMALIZAÇÃO
   addresses Address[]
   contacts  Contact[]
 
-  // NOVO: relações normalizadas de serviços e tags
-  services ClientService[]   // many-to-many com Service
-  tagLinks ClientTag[]       // many-to-many com Tag (nome escolhido para não colidir com tags[] legado)
+  // Serviços / Tags
+  services ClientService[]
+  tagLinks ClientTag[]
 
-  // NOVO: vínculo com planos (tabela pivot)
+  // Planos
   healthPlans ClientHealthPlan[]
 
-  // NOVO: histórico de erros de importação
+  // Import
   importErrors BeneficiarioImportError[]
 
+  // Conciliação / Comissões
+  conciliacoes     Conciliacao[]
+  comissoes        ComissaoLancamento[]
+  commissionRules  CommissionRule[] @relation("Client_CommissionRules")
+
+  // ---- NOVO: back-relation de documentos do cliente
+  documents Document[]
+
   @@unique([corretorId, id])
-  // ⚠️ NÃO usamos mais @@unique para email/document aqui por causa do soft delete.
-  // Unicidade é garantida por índices parciais criados via SQL (ver migração).
   @@index([corretorId, email])
   @@index([corretorId, name])
   @@index([corretorId, status])
   @@index([corretorId, createdAt])
   @@index([corretorId, document])
-  @@index([corretorId, deletedAt]) // <— para filtrar ativos
+  @@index([corretorId, deletedAt])
   @@map("clients")
 }
 
@@ -199,7 +240,7 @@ model Policy {
   clientId   String
 
   corretor Corretor @relation("PolicyCorretor", fields: [corretorId], references: [id], onDelete: Cascade)
-  client   Client   @relation("PolicyClient", fields: [corretorId, clientId], references: [corretorId, id], onDelete: Cascade)
+  client   Client   @relation("PolicyClient",   fields: [corretorId, clientId], references: [corretorId, id], onDelete: Cascade)
 
   policyNumber String
   insurer      String
@@ -226,7 +267,6 @@ model RegraCobranca {
   cliente           Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
   descricao         String
   dataCorteCobranca Int
-  // 👇 política avançada (pró-rata, corte, tolerância, etc.)
   policy            Json?
 
   createdAt         DateTime @default(now())
@@ -239,20 +279,19 @@ model RegraCobranca {
 }
 
 model Beneficiario {
-  id        String   @id @default(cuid())
-  clientId  String
-  cliente   Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  titularId String?
-  titular     Beneficiario?  @relation("TitularDependentes", fields: [titularId], references: [id], onDelete: SetNull)
-  dependentes Beneficiario[] @relation("TitularDependentes")
+  id         String   @id @default(cuid())
+  clientId   String
+  cliente    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  titularId  String?
+  titular      Beneficiario?  @relation("TitularDependentes", fields: [titularId], references: [id], onDelete: SetNull)
+  dependentes  Beneficiario[] @relation("TitularDependentes")
 
-  // --- Campos do Arquivo / Layout completo ---
   nomeCompleto     String
   cpf              String?            @db.VarChar(14)
   tipo             BeneficiarioTipo
-  dataEntrada      DateTime           // VIGENCIA
+  dataEntrada      DateTime
   dataSaida        DateTime?
-  valorMensalidade Decimal?           @db.Decimal(12, 2) // ↑ precisão p/ contratos maiores
+  valorMensalidade Decimal?           @db.Decimal(12, 2)
   status           BeneficiarioStatus @default(ATIVO)
   matricula        String?
   carteirinha      String?
@@ -263,15 +302,18 @@ model Beneficiario {
   faixaEtaria      String?
   estado           String?
   contrato         String?
-  comentario       String?            // AÇÃO virou comentário
+  comentario       String?
 
-  // 👇 Novos opcionais (regras / auditoria de movimentos)
   regimeCobranca   RegimeCobranca?
   motivoMovimento  MotivoMovimento?
   observacoes      String?
 
   regraCobrancaId String?
   regraCobranca   RegraCobranca? @relation(fields: [regraCobrancaId], references: [id], onDelete: SetNull)
+
+  // back-relations
+  concItems ConciliacaoItem[]   @relation("Beneficiario_ConciliacaoItems")
+  comissoes ComissaoLancamento[] @relation("Beneficiario_ComissaoLancamentos")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -291,10 +333,10 @@ model BeneficiarioImportError {
   clientId   String
   cliente    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
-  uploadedBy String?   // opcional: ID do usuário que importou
-  linha      Int       // linha da planilha com erro
-  motivo     String    // descrição do problema encontrado
-  dados      Json      // linha original da planilha
+  uploadedBy String?
+  linha      Int
+  motivo     String
+  dados      Json
 
   createdAt  DateTime  @default(now())
 
@@ -310,15 +352,16 @@ model FaturaImportada {
   mesReferencia             DateTime
   nomeBeneficiarioOperadora String?
   cpfBeneficiarioOperadora  String?  @db.VarChar(14)
-  valorCobradoOperadora     Decimal? @db.Decimal(12, 2) // ↑ precisão
+  valorCobradoOperadora     Decimal? @db.Decimal(12, 2)
   statusConciliacao         String?
 
   raw       Json?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // 👇 Itens detalhados da fatura (espelho do layout)
-  itens FaturaItem[]
+  // Detalhes / relações
+  itens      FaturaItem[]
+  concItems  ConciliacaoItem[] @relation("FaturaImportada_ConciliacaoItems")
 
   @@index([clientId, mesReferencia])
   @@map("health_imported_invoices")
@@ -361,16 +404,20 @@ model FaturaItem {
   @@map("health_imported_invoice_items")
 }
 
-// ---------- HEALTH PLANOS / PREÇOS (NOVO) ----------
+// ---------- HEALTH PLANOS / PREÇOS ----------
 model HealthPlan {
   id       String  @id @default(cuid())
   slug     String  @unique
   name     String
   isActive Boolean @default(true)
 
-  aliases PlanAlias[]
-  prices  HealthPlanPrice[]
-  clients ClientHealthPlan[]
+  aliases          PlanAlias[]
+  prices           HealthPlanPrice[]
+  clients          ClientHealthPlan[]
+
+  // back-relations para regras e comissões
+  commissionRules  CommissionRule[]      @relation("HealthPlan_CommissionRules")
+  comissoes        ComissaoLancamento[]  @relation("HealthPlan_ComissaoLancamentos")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -414,7 +461,7 @@ model ClientHealthPlan {
   planId   String
   isActive Boolean @default(true)
 
-  client Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  client Client     @relation(fields: [clientId], references: [id], onDelete: Cascade)
   plan   HealthPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
 
   prices ClientHealthPlanPrice[]
@@ -443,6 +490,133 @@ model ClientHealthPlanPrice {
   @@index([clientId, planId, vigenciaInicio, vigenciaFim])
   @@index([clientId, planId, faixaEtaria])
   @@map("client_health_plan_prices")
+}
+
+// ---------- CONCILIAÇÃO ----------
+model Conciliacao {
+  id            String            @id @default(cuid())
+  clientId      String
+  client        Client            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  mesReferencia DateTime
+  status        ConciliacaoStatus @default(ABERTA)
+
+  // snapshots e filtros do fechamento
+  totals  Json?
+  filtros Json?
+  counts  Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdBy String?
+  closedBy  String?
+  closedAt  DateTime?
+
+  items     ConciliacaoItem[]
+  comissoes ComissaoLancamento[]
+
+  @@unique([clientId, mesReferencia], name: "clientId_mesReferencia")
+  @@index([clientId, status, mesReferencia])
+  @@map("reconciliation_runs")
+}
+
+model ConciliacaoItem {
+  id             String        @id @default(cuid())
+  conciliacaoId  String
+  conciliacao    Conciliacao   @relation(fields: [conciliacaoId], references: [id], onDelete: Cascade)
+
+  faturaId       String?
+  fatura         FaturaImportada? @relation("FaturaImportada_ConciliacaoItems", fields: [faturaId], references: [id], onDelete: SetNull)
+
+  beneficiarioId String?
+  beneficiario   Beneficiario?    @relation("Beneficiario_ConciliacaoItems", fields: [beneficiarioId], references: [id], onDelete: SetNull)
+
+  cpf            String? @db.VarChar(14)
+  nome           String?
+
+  valorCobrado   Decimal?      @db.Decimal(12, 2)
+  valorCadastro  Decimal?      @db.Decimal(12, 2)
+  diferenca      Decimal?      @db.Decimal(12, 2)
+
+  // 'OK' | 'DIVERGENTE' | 'DUPLICADO' | 'SOFATURA' | 'SOCADASTRO'
+  statusLinha    String
+
+  plano          String?
+  centroCusto    String?
+  faixaEtaria    String?
+  regimeCobranca RegimeCobranca?
+  motivoMovimento MotivoMovimento?
+
+  raw Json?
+  createdAt DateTime @default(now())
+
+  @@index([conciliacaoId, statusLinha])
+  @@map("reconciliation_items")
+}
+
+// ---------- REGRAS DE COMISSÃO ----------
+model CommissionRule {
+  id             String          @id @default(cuid())
+
+  corretorId     String
+  corretor       Corretor        @relation("Corretor_CommissionRules", fields: [corretorId], references: [id], onDelete: Cascade)
+
+  clientId       String?
+  client         Client?         @relation("Client_CommissionRules", fields: [clientId], references: [id], onDelete: SetNull)
+
+  planId         String?
+  plan           HealthPlan?     @relation("HealthPlan_CommissionRules", fields: [planId], references: [id], onDelete: SetNull)
+
+  faixaEtaria    String?
+  regimeCobranca RegimeCobranca?
+
+  vigenciaInicio DateTime
+  vigenciaFim    DateTime?
+
+  percent        Decimal?        @db.Decimal(7, 6)
+  valorFixo      Decimal?        @db.Decimal(12, 2)
+  baseSource     String?         // 'INVOICE' | 'CADASTRO' | 'MIN' | 'MAX' | 'ZERO_IF_MISMATCH'
+
+  isActive       Boolean         @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([corretorId, clientId, planId, faixaEtaria, vigenciaInicio, vigenciaFim])
+  @@map("commission_rules")
+}
+
+// ---------- LANÇAMENTOS DE COMISSÃO ----------
+model ComissaoLancamento {
+  id             String          @id @default(cuid())
+
+  clientId       String
+  client         Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  conciliacaoId  String
+  conciliacao    Conciliacao     @relation(fields: [conciliacaoId], references: [id], onDelete: Cascade)
+
+  beneficiarioId String?
+  beneficiario   Beneficiario?   @relation("Beneficiario_ComissaoLancamentos", fields: [beneficiarioId], references: [id], onDelete: SetNull)
+
+  planId         String?
+  plan           HealthPlan?     @relation("HealthPlan_ComissaoLancamentos", fields: [planId], references: [id], onDelete: SetNull)
+
+  competencia    DateTime
+  base           Decimal         @db.Decimal(12, 2)
+  aliquota       Decimal?        @db.Decimal(7, 6)
+  valor          Decimal         @db.Decimal(12, 2)
+
+  status         ComissaoStatus  @default(A_RECEBER)
+  dueDate        DateTime?
+  receivedAt     DateTime?
+  reference      Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId, competencia, status])
+  @@index([conciliacaoId])
+  @@map("commission_accruals")
 }
 
 // ---------- NORMALIZAÇÃO ----------
@@ -487,7 +661,7 @@ model Contact {
   @@map("contatos")
 }
 
-// ---------- SERVICES / TAGS (NOVO) ----------
+// ---------- SERVICES / TAGS ----------
 model Service {
   id       String         @id @default(cuid())
   slug     String         @unique
@@ -555,4 +729,39 @@ model AuditLog {
 
   @@index([corretorId, entity, entityId, at])
   @@map("audit_log")
+}
+
+// ---------- NOVO: DOCUMENTOS ----------
+model Document {
+  id          String   @id @default(cuid())
+
+  corretorId  String
+  clientId    String
+  policyId    String? // opcional: referência direta a Policy.id (quando fizer sentido)
+
+  filename    String
+  mimeType    String
+  size        Int
+  category    DocumentCategory @default(ANEXO)
+  tags        String[]         @default([])
+  notes       String?
+
+  storageKey  String   @unique // ex: s3://bucket/tenants/{corretorId}/clients/{clientId}/{uuid}
+  checksum    String?          // sha256 (opcional)
+
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  deletedAt   DateTime?
+
+  // relações
+  client   Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  corretor Corretor @relation(fields: [corretorId], references: [id], onDelete: Cascade)
+
+  // NOTE: se quiser atrelar ao seguro, você pode futuramente criar:
+  // policy  Policy?  @relation(fields: [policyId], references: [id], onDelete: SetNull)
+  // e um @@index(policyId)
+
+  @@index([corretorId, clientId, category, createdAt])
+  @@map("documents")
 }

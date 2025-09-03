@@ -95,6 +95,11 @@ export class InvoicesController {
     @Param('clientId') clientId: string,
     @Body() body: reconcileInvoicesDTO,
   ) {
-    return this.invoicesService.reconcileByIds(clientId, body.invoiceIds);
+    // Agora suporta:
+    // - invoiceIds (legado)
+    // - openMonth
+    // - closeMonth + closure{ valorTotalInformado, observacoes, gerarComissoesAgora }
+    // - updateClosure + closure{ ... }
+    return this.invoicesService.reconcile(clientId, body);
   }
 }

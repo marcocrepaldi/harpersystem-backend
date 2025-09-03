@@ -1,12 +1,7 @@
-import {
-  IsBoolean,
-  IsNotEmpty,
-  IsOptional,
-  IsString,
-} from 'class-validator';
+import { IsBoolean, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class CreatePlanDto {
-  /** slug único, ex.: "UNIMED-NACIONAL" */
+  /** slug único, ex.: "unimed-nacional" */
   @IsString()
   @IsNotEmpty()
   slug!: string;
@@ -39,7 +34,7 @@ export class CreatePlanAliasDto {
 }
 
 export class CreatePlanPriceDto {
-  /** ID do plano (será preenchido pela rota /:planId/prices) */
+  /** ID do plano (preenchido pela rota /:planId/prices) */
   @IsString()
   @IsNotEmpty()
   planId!: string;

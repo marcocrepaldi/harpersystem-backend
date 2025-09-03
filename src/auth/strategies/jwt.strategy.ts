@@ -2,7 +2,7 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
-import { JwtAccessPayload } from '../decorators/current-user.decorator';
+import type { JwtAccessPayload } from '@/auth/decorators/current-user.decorator';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
@@ -21,12 +21,29 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
   }
 
   async validate(payload: any): Promise<JwtAccessPayload> {
-    // Bloqueia uso de RT em rotas de acesso
+    // Bloqueia uso de refresh token em rotas de access
     if (payload?.typ === 'refresh') {
       throw new UnauthorizedException('Invalid token type for this route');
     }
-    // Ergonomia: garantir userId
-    return { ...payload, userId: payload.sub } as JwtAccessPayload;
+
+    // Normaliza o shape do req.user para o projeto
+    const user: JwtAccessPayload = {
+      sub: payload.sub,
+      userId: payload.sub, // ergonomia
+      email: payload.email,
+      role: payload.role,
+      corretorId: payload.corretorId,
+      iat: payload.iat,
+      exp: payload.exp,
+      typ: 'access',
+    };
+
+    // (opcional) sanity-check
+    if (!user.corretorId) {
+      // Isso não deveria acontecer se o token foi emitido pelo seu AuthService
+      throw new UnauthorizedException('Token sem corretorId.');
+    }
+
+    return user;
   }
 }
-// ✅ exportação nomeada já está correta
