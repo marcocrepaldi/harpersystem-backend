@@ -31,10 +31,10 @@ function parseCurrencyToNumber(v: unknown): number {
   return Number.isFinite(n) ? n : NaN;
 }
 
-/** Aceita tanto {valorFaturaDeclarado, observacaoFechamento} quanto {totalFatura, observacoes} */
+/** Aceita tanto {valorFaturaDeclarado, observacaoFechamento} quanto {totalFatura, observacoes}; inclui insurerId opcional */
 function normalizeCloseBody(
   body: any,
-): { mes: string; totalFatura: number; observacoes?: string } {
+): { mes: string; totalFatura: number; observacoes?: string; insurerId?: string } {
   if (!body || typeof body !== 'object') {
     throw new BadRequestException('Payload inválido.');
   }
@@ -57,7 +57,12 @@ function normalizeCloseBody(
   const observacoes =
     typeof notes === 'string' && notes.trim().length ? notes.trim() : undefined;
 
-  return { mes, totalFatura: total, observacoes };
+  const insurerId =
+    typeof body.insurerId === 'string' && body.insurerId.trim().length
+      ? body.insurerId.trim()
+      : undefined;
+
+  return { mes, totalFatura: total, observacoes, insurerId };
 }
 
 @Controller('clients/:clientId/reconciliation')
@@ -71,6 +76,7 @@ export class ReconciliationController {
     @Query('tipo') tipo?: TipoParam,
     @Query('plano') plano?: string,
     @Query('centro') centro?: string,
+    @Query('insurerId') insurerId?: string, // NOVO (opcional)
   ) {
     if (mes && !/^\d{4}-\d{2}$/.test(mes)) {
       throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
@@ -83,6 +89,7 @@ export class ReconciliationController {
         plano: plano?.trim() || undefined,
         centro: centro?.trim() || undefined,
       },
+      insurerId: insurerId?.trim() || undefined,
     });
   }
 
@@ -109,6 +116,7 @@ export class ReconciliationController {
     @Query('tipo') tipo?: TipoParam,
     @Query('plano') plano?: string,
     @Query('centro') centro?: string,
+    @Query('insurerId') insurerId?: string, // NOVO (opcional)
   ): Promise<StreamableFile> {
     if (mes && !/^\d{4}-\d{2}$/.test(mes)) {
       throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
@@ -126,6 +134,7 @@ export class ReconciliationController {
         plano: plano?.trim() || undefined,
         centro: centro?.trim() || undefined,
       },
+      insurerId: insurerId?.trim() || undefined,
     });
 
     return new StreamableFile(file.buffer, {
@@ -138,7 +147,7 @@ export class ReconciliationController {
   @Post('close')
   async closeManual(
     @Param('clientId', ParseCuidPipe) clientId: string,
-    @Body() body: CloseReconciliationDTO | { mes: string; totalFatura: number; observacoes?: string },
+    @Body() body: CloseReconciliationDTO | { mes: string; totalFatura: number; observacoes?: string; insurerId?: string },
   ) {
     const normalized = normalizeCloseBody(body);
     return this.svc.closeManual(clientId, normalized, undefined);
@@ -149,8 +158,9 @@ export class ReconciliationController {
   async reopen(
     @Param('clientId', ParseCuidPipe) clientId: string,
     @Body() dto: OpenReconciliationDTO, // { mes: 'YYYY-MM' }
+    @Query('insurerId') insurerId?: string, // NOVO (opcional via query para manter DTO existente)
   ) {
-    return this.svc.reopen(clientId, { mes: dto.mes }, undefined);
+    return this.svc.reopen(clientId, { mes: dto.mes, insurerId: insurerId?.trim() || undefined }, undefined);
   }
 
   // ---- Histórico (consulta paginada) ----
@@ -163,6 +173,7 @@ export class ReconciliationController {
     @Query('page') pageStr?: string,
     @Query('limit') limitStr?: string,
     @Query('order') order: 'asc' | 'desc' = 'desc',
+    @Query('insurerId') insurerId?: string, // NOVO (opcional)
   ) {
     const ymOk = (s?: string) => !s || /^\d{4}-\d{2}$/.test(s);
     if (!ymOk(fromYM) || !ymOk(toYM)) {
@@ -179,6 +190,7 @@ export class ReconciliationController {
       limit,
       status: st as any,
       order,
+      insurerId: insurerId?.trim() || undefined,
     });
   }
 
@@ -192,6 +204,7 @@ export class ReconciliationController {
     @Query('to') toYM?: string,
     @Query('status') status?: 'OPEN' | 'CLOSED' | 'ALL',
     @Query('format') format: 'xlsx' | 'csv' = 'xlsx',
+    @Query('insurerId') insurerId?: string, // NOVO (opcional)
   ): Promise<StreamableFile> {
     const ymOk = (s?: string) => !s || /^\d{4}-\d{2}$/.test(s);
     if (!ymOk(fromYM) || !ymOk(toYM)) {
@@ -204,6 +217,7 @@ export class ReconciliationController {
       toYM,
       status: st as any,
       format,
+      insurerId: insurerId?.trim() || undefined,
     });
 
     return new StreamableFile(file.buffer, {

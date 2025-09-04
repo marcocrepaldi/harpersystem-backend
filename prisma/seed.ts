@@ -1,32 +1,20 @@
-import { PrismaClient } from "@prisma/client";
-
+import { PrismaClient, InsuranceLine } from '@prisma/client';
 const prisma = new PrismaClient();
 
 async function main() {
-  const regras = await prisma.regraCobranca.findMany();
-
-  for (const regra of regras) {
-    await prisma.regraCobranca.update({
-      where: { id: regra.id },
-      data: {
-        policy: {
-          proRata: true, // calcula proporcional no 1º mês
-          considerarVigencia: true, // usa campo "dataEntrada" do beneficiário
-          toleranciaCentavos: 0.05, // ignora diferenças < 5 centavos
-          cobrarSomenteApartirVigencia: true, // ignora beneficiários com início futuro
-        },
-      },
+  const carriers = [
+    { slug: 'amil', tradeName: 'Amil', legalName: 'AMIL ASSISTÊNCIA MÉDICA INTERNACIONAL S.A.', lines: [InsuranceLine.HEALTH] },
+    { slug: 'bradesco-saude', tradeName: 'Bradesco Saúde', legalName: 'BRADESCO SAÚDE S.A.', lines: [InsuranceLine.HEALTH] },
+    { slug: 'sulamerica', tradeName: 'SulAmérica Saúde', legalName: 'SUL AMÉRICA COMPANHIA DE SEGURO SAÚDE', lines: [InsuranceLine.HEALTH] },
+    { slug: 'hapvida', tradeName: 'Hapvida', legalName: 'HAPVIDA ASSISTÊNCIA MÉDICA LTDA.', lines: [InsuranceLine.HEALTH] },
+    { slug: 'notredame', tradeName: 'NotreDame Intermédica', legalName: 'NOTRE DAME INTERMÉDICA SAÚDE S.A.', lines: [InsuranceLine.HEALTH] },
+  ];
+  for (const c of carriers) {
+    await prisma.insurer.upsert({
+      where: { slug: c.slug },
+      update: { tradeName: c.tradeName, legalName: c.legalName, lines: c.lines },
+      create: { slug: c.slug, tradeName: c.tradeName, legalName: c.legalName, lines: c.lines },
     });
   }
 }
-
-main()
-  .then(() => {
-    console.log("✅ Seed aplicado com sucesso!");
-  })
-  .catch((e) => {
-    console.error("❌ Erro no seed:", e);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+main().finally(() => prisma.$disconnect());

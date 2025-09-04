@@ -20,6 +20,8 @@ import { HealthPlanModule } from './healthplan/plans.module';
 import { ClientPlansModule } from './healthplan/client-plans.module';
 import { ImportErrorsModule } from './import-errors/import-errors.module';
 import { DocumentsModule } from './documents/documents.module';
+import { InsurersModule } from './insurers/insurers.module';
+import { InsurerBillingRulesModule } from './insurer-billing-rules/insurer-billing-rules.module';
 
 @Module({
   imports: [
@@ -39,7 +41,9 @@ import { DocumentsModule } from './documents/documents.module';
     HealthPlanModule,
     ClientPlansModule,
     ImportErrorsModule,
-    DocumentsModule
+    DocumentsModule,
+    InsurersModule,
+    InsurerBillingRulesModule
   ],
   controllers: [AppController],
   providers: [

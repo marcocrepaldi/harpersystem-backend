@@ -11,6 +11,7 @@ import { listImportedInvoicesDTO, reconcileInvoicesDTO } from './dto/invoices.dt
  * - Converte valores monetários de forma resiliente
  * - Filtra por coluna "credencial" mantendo apenas linhas cujo prefixo é "0TATM"
  * - Grava em "health_imported_invoices" (tabela FaturaImportada), 1 linha/beneficiário
+ * - Suporte multi-operadora (insurerId opcional)
  */
 @Injectable()
 export class InvoicesService {
@@ -134,8 +135,13 @@ export class InvoicesService {
   /**
    * Importa arquivo e grava em FaturaImportada (1 linha/beneficiário).
    * Filtra por credencial começando com 0TATM, economizando memória.
+   * Suporta `insurerId` (se informado, sobrescreve apenas daquele mês/operadora).
    */
-  async processInvoiceUpload(clientId: string, file: Express.Multer.File) {
+  async processInvoiceUpload(
+    clientId: string,
+    file: Express.Multer.File,
+    insurerId?: string,
+  ) {
     if (!file) throw new BadRequestException('Nenhum arquivo enviado.');
 
     const name = (file.originalname || '').toLowerCase();
@@ -366,7 +372,14 @@ export class InvoicesService {
 
     await this.prisma.$transaction(async (tx) => {
       // sobrescreve importações do mesmo mês/cliente
-      await tx.faturaImportada.deleteMany({ where: { clientId, mesReferencia } });
+      // se insurerId informado -> apaga só daquela operadora; senão, apaga as que não têm operadora (NULL)
+      await tx.faturaImportada.deleteMany({
+        where: {
+          clientId,
+          mesReferencia,
+          ...(insurerId ? { insurerId } : { insurerId: null }),
+        },
+      });
 
       for (const rec of kept) {
         const nome = ((): any => {
@@ -395,13 +408,13 @@ export class InvoicesService {
         await tx.faturaImportada.create({
           data: {
             cliente: { connect: { id: clientId } },
+            // ✅ usa relação "insurer" quando informado (em vez de insurerId direto)
+            ...(insurerId ? { insurer: { connect: { id: insurerId } } } : {}),
             mesReferencia,
             nomeBeneficiarioOperadora: (nome ?? '').toString() || null,
             cpfBeneficiarioOperadora: cpf,
             valorCobradoOperadora: valor === null || Number.isNaN(valor) ? null : valor,
             statusConciliacao: 'pendente',
-            // Para reduzir ainda mais, você pode gravar apenas { credencial }:
-            // raw: { credencial: pick(rec, CREDENCIAL_ALIASES) ?? null },
             raw: rec,
           },
         });
@@ -428,15 +441,18 @@ export class InvoicesService {
       mesReferencia: `${mesReferencia.getUTCFullYear()}-${String(
         mesReferencia.getUTCMonth() + 1,
       ).padStart(2, '0')}`,
+      insurerId: insurerId ?? null,
     };
   }
 
   /**
    * Lista faturas importadas do mês, com paginação e (opcional) busca simples.
+   * Se `insurerId` for informado, filtra por operadora; caso contrário, traz todas (independente de operadora).
    */
   async listImported(
     clientId: string,
     { mes, page = 1, limit = 100, search }: listImportedInvoicesDTO,
+    insurerId?: string,
   ) {
     const today = new Date();
     const ym =
@@ -450,6 +466,7 @@ export class InvoicesService {
     const whereBase = {
       clientId,
       mesReferencia: { gte: startDate, lt: endDate },
+      ...(insurerId ? { insurerId } : {}), // ✅ filtro opcional por operadora
       ...(search
         ? {
             OR: [
@@ -482,18 +499,24 @@ export class InvoicesService {
       data: faturas,
       hasMore: page * limit < totalCount,
       mes: ym,
+      insurerId: insurerId ?? null,
     };
   }
 
   /**
-   * Remove todas as importações do mês/cliente.
+   * Remove importações do mês/cliente.
+   * Se `insurerId` for informado, apaga apenas daquela operadora; senão, apaga todas as importações do mês.
    */
-  async deleteInvoiceByMonth(clientId: string, mesReferencia: Date) {
-    const { count } = await this.prisma.faturaImportada.deleteMany({
-      where: { clientId, mesReferencia },
-    });
+  async deleteInvoiceByMonth(clientId: string, mesReferencia: Date, insurerId?: string) {
+    const where = {
+      clientId,
+      mesReferencia,
+      ...(insurerId ? { insurerId } : {}), // ✅ condicional
+    };
+
+    const { count } = await this.prisma.faturaImportada.deleteMany({ where });
     return {
-      message: `Foram deletadas ${count} faturas do mês de referência.`,
+      message: `Foram deletadas ${count} faturas do mês de referência${insurerId ? ` (operadora ${insurerId})` : ''}.`,
       deletedCount: count,
     };
   }

@@ -27,6 +27,11 @@ export class listImportedInvoicesDTO {
   @IsOptional()
   @IsString()
   search?: string;
+
+  // NOVO: permite filtrar/operar por operadora
+  @IsOptional()
+  @IsString()
+  insurerId?: string;
 }
 
 export class ClosurePayloadDTO {

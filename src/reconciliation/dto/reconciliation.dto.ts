@@ -1,4 +1,3 @@
-// src/reconciliation/dto/reconciliation.dto.ts
 import { Type, Transform } from 'class-transformer';
 import {
   IsOptional,
@@ -43,6 +42,12 @@ export class CloseReconciliationDTO {
   @IsOptional()
   @IsString()
   observacaoFechamento?: string;
+
+  /** NOVO: permite informar a seguradora */
+  @Transform(({ value }) => emptyToUndefined(value))
+  @IsOptional()
+  @IsString()
+  insurerId?: string;
 }
 
 export class UpdateCloseReconciliationDTO {
@@ -61,6 +66,12 @@ export class UpdateCloseReconciliationDTO {
   @IsOptional()
   @IsString()
   observacaoFechamento?: string;
+
+  /** NOVO: permite atualizar fechamento por seguradora */
+  @Transform(({ value }) => emptyToUndefined(value))
+  @IsOptional()
+  @IsString()
+  insurerId?: string;
 }
 
 export class HistoryQueryDTO {
@@ -91,4 +102,10 @@ export class HistoryQueryDTO {
   @Min(1)
   @Max(500)
   limit?: number = 24;
+
+  /** NOVO: permite filtrar histórico por seguradora */
+  @Transform(({ value }) => emptyToUndefined(value))
+  @IsOptional()
+  @IsString()
+  insurerId?: string;
 }

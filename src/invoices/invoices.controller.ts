@@ -1,18 +1,19 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Delete,
   Get,
   Header,
-  MaxFileSizeValidator,
+  HttpCode,
   Param,
+  ParseFilePipe,
+  Patch,
   Post,
   Query,
   UploadedFile,
   UseInterceptors,
-  Body,
-  Patch,
-  ParseFilePipe,
+  MaxFileSizeValidator, // ✅ volta a usar o validador oficial do Nest
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { InvoicesService } from './invoices.service';
@@ -32,6 +33,7 @@ export class InvoicesController {
       }),
     )
     file: Express.Multer.File,
+    @Query('insurerId') insurerId?: string, // opcional: multi-operadora
   ) {
     if (!file) {
       throw new BadRequestException('Nenhum arquivo enviado.');
@@ -58,7 +60,9 @@ export class InvoicesController {
       );
     }
 
-    return this.invoicesService.processInvoiceUpload(clientId, file);
+    const insurer = (insurerId || '').trim() || undefined;
+
+    return this.invoicesService.processInvoiceUpload(clientId, file, insurer);
   }
 
   @Get()
@@ -66,8 +70,9 @@ export class InvoicesController {
   async listByMonth(
     @Param('clientId') clientId: string,
     @Query() query: listImportedInvoicesDTO,
+    @Query('insurerId') insurerId?: string, // opcional: filtrar por operadora
   ) {
-    return this.invoicesService.listImported(clientId, query);
+    return this.invoicesService.listImported(clientId, query, insurerId?.trim() || undefined);
   }
 
   @Delete()
@@ -75,6 +80,7 @@ export class InvoicesController {
   async deleteByMonth(
     @Param('clientId') clientId: string,
     @Query('mes') mes?: string,
+    @Query('insurerId') insurerId?: string, // opcional: apagar apenas daquela operadora
   ) {
     if (!mes) {
       throw new BadRequestException('Parâmetro "mes" é obrigatório (YYYY-MM).');
@@ -86,7 +92,11 @@ export class InvoicesController {
     const [y, m] = mes.split('-').map(Number);
     const mesReferencia = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0, 0));
 
-    return this.invoicesService.deleteInvoiceByMonth(clientId, mesReferencia);
+    return this.invoicesService.deleteInvoiceByMonth(
+      clientId,
+      mesReferencia,
+      insurerId?.trim() || undefined,
+    );
   }
 
   @Patch('reconcile')

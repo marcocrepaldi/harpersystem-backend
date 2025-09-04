@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Prisma } from '@prisma/client';
+import { Prisma, RegimeCobranca } from '@prisma/client';
 import * as XLSX from 'xlsx';
 
 // ---------- tipos ----------
@@ -58,6 +58,22 @@ type FaturaRow = {
   nomeCompleto: string | null;
   cpf: string | null;
   valorPlano: unknown;
+};
+
+// === regras de seguradora ===
+type PolicyJson = {
+  // arredondamento
+  rounding?: { mode?: 'NEAREST'|'UP'|'DOWN'; precision?: number };
+  // pró-rata
+  prorate?: { enabled?: boolean; basis?: 'CALENDAR_DAYS'|'30/360'; minDays?: number };
+  // limites
+  minCharge?: number | null;
+  maxCharge?: number | null;
+  // taxas
+  fees?: Array<
+    | { type: 'FIXED'; amount: number; when?: 'BEFORE_ROUND' | 'AFTER_ROUND' }
+    | { type: 'PERCENT'; rate: number; base?: 'GROSS'|'AFTER_PRORATE_BEFORE_FEES'; when?: 'BEFORE_ROUND'|'AFTER_ROUND' }
+  >;
 };
 
 @Injectable()
@@ -124,6 +140,128 @@ export class ReconciliationService {
     return where;
   }
 
+  // === regras de seguradora ===
+  private async loadActiveRules(insurerId: string, clientId: string, start: Date, end: Date) {
+    // vigência que intersecta o mês
+    return this.prisma.insurerBillingRule.findMany({
+      where: {
+        insurerId,
+        isActive: true,
+        validFrom: { lte: end },
+        OR: [{ validTo: null }, { validTo: { gt: start } }],
+      },
+      orderBy: [{ validFrom: 'desc' }, { updatedAt: 'desc' }],
+      select: {
+        id: true, insurerId: true, clientId: true, planId: true, faixaEtaria: true, regime: true, policy: true, validFrom: true, validTo: true,
+      },
+    });
+  }
+
+  private pickBestRule(rules: Array<any>, ctx: {
+    clientId: string;
+    planId?: string;
+    faixaEtaria?: string | null;
+    regime?: RegimeCobranca | null;
+  }) {
+    let best: any | undefined;
+    let bestScore = -1;
+    for (const r of rules) {
+      let score = 0;
+      if (r.clientId && r.clientId === ctx.clientId) score += 8;
+      if (r.planId && r.planId === ctx.planId) score += 4;
+      if (r.faixaEtaria && r.faixaEtaria === (ctx.faixaEtaria ?? undefined)) score += 2;
+      if (r.regime && r.regime === (ctx.regime ?? undefined)) score += 1;
+      if (score > bestScore) {
+        bestScore = score;
+        best = r;
+      }
+    }
+    return best;
+  }
+
+  private daysBetween(start: Date, end: Date) {
+    return Math.max(0, Math.round((end.getTime() - start.getTime()) / 86400000));
+  }
+
+  private applyPolicy(base: number, ben: {
+    dataEntrada?: Date | null;
+    dataSaida?: Date | null;
+    regimeCobranca?: RegimeCobranca | null;
+  }, monthStart: Date, monthEnd: Date, policy: PolicyJson): number {
+    if (!Number.isFinite(base)) return 0;
+
+    let amount = base;
+
+    // pró-rata
+    const needProrate = policy?.prorate?.enabled || ben.regimeCobranca === 'DIARIO';
+    if (needProrate) {
+      const covStart = new Date(Math.max((ben.dataEntrada?.getTime() ?? -Infinity), monthStart.getTime()));
+      const covEnd   = new Date(Math.min(((ben.dataSaida ? new Date(ben.dataSaida.getTime()+86400000) : monthEnd).getTime()), monthEnd.getTime())); // end exclusivo
+      const coveredDays = Math.max(0, this.daysBetween(covStart, covEnd));
+      const basis = policy?.prorate?.basis === '30/360' ? 30 : Math.max(28, this.daysBetween(monthStart, monthEnd)); // dias no mês
+      const minDays = policy?.prorate?.minDays ?? 0;
+
+      const daily = base / (basis || 30);
+      const chargeableDays = Math.max(coveredDays, minDays);
+      amount = daily * chargeableDays;
+    }
+
+    // fees BEFORE_ROUND (default)
+    for (const f of (policy?.fees ?? [])) {
+      if ((f as any).when && (f as any).when !== 'BEFORE_ROUND') continue;
+      if (f.type === 'FIXED') amount += f.amount;
+      if (f.type === 'PERCENT') {
+        const baseRef = (f as any).base === 'GROSS' ? base : amount;
+        amount += baseRef * f.rate;
+      }
+    }
+
+    // arredondamento
+    const mode = policy?.rounding?.mode ?? 'NEAREST';
+    const prec = Math.max(0, policy?.rounding?.precision ?? 2);
+    const factor = Math.pow(10, prec);
+    if (mode === 'UP') amount = Math.ceil(amount * factor) / factor;
+    else if (mode === 'DOWN') amount = Math.floor(amount * factor) / factor;
+    else amount = Math.round(amount * factor) / factor;
+
+    // fees AFTER_ROUND
+    for (const f of (policy?.fees ?? [])) {
+      if ((f as any).when === 'AFTER_ROUND') {
+        if (f.type === 'FIXED') amount += f.amount;
+        if (f.type === 'PERCENT') amount += amount * f.rate;
+      }
+    }
+
+    // limites
+    if (typeof policy?.minCharge === 'number') amount = Math.max(amount, policy!.minCharge!);
+    if (typeof policy?.maxCharge === 'number') amount = Math.min(amount, policy!.maxCharge!);
+
+    return amount;
+  }
+
+  private async resolvePlanIdByNameCached(
+    cache: Map<string, string | null>,
+    insurerId: string,
+    planName?: string | null,
+  ): Promise<string | undefined> {
+    const key = `${insurerId}::${(planName || '').trim().toLowerCase()}`;
+    if (!planName || !key.trim()) return undefined;
+    if (cache.has(key)) return cache.get(key) || undefined;
+
+    const plan = await this.prisma.healthPlan.findFirst({
+      where: {
+        insurerId,
+        OR: [
+          { name: { equals: planName, mode: 'insensitive' } },
+          { aliases: { some: { alias: { equals: planName, mode: 'insensitive' } } } },
+        ],
+      },
+      select: { id: true },
+    });
+    cache.set(key, plan ? plan.id : null);
+    return plan?.id;
+  }
+
   // ---------- opções ----------
   async getFilterOptions(clientId: string) {
     const [planos, centros] = await Promise.all([
@@ -151,7 +289,7 @@ export class ReconciliationService {
   // ---------- conciliação ----------
   async buildReconciliation(
     clientId: string,
-    opts?: { mesReferencia?: Date | string; filters?: Filters },
+    opts?: { mesReferencia?: Date | string; filters?: Filters; insurerId?: string },
   ): Promise<ReconciliationPayload> {
     const client = await this.prisma.client.findUnique({ where: { id: clientId }, select: { id: true } });
     if (!client) throw new NotFoundException('Cliente não encontrado.');
@@ -162,8 +300,9 @@ export class ReconciliationService {
     const next = this.nextMonthUTC(start);
     const filters = opts?.filters ?? {};
     const anyFilter = !!(filters.tipo || filters.plano || filters.centro);
+    const insurerId = opts?.insurerId ?? undefined;
 
-    // 1) tenta itens
+    // 1) tenta itens (filtra por insurerId)
     let rows = await this.prisma.$queryRaw<FaturaRow[]>(Prisma.sql`
       SELECT i."id", i."nomeCompleto", i."cpf", i."valorPlano"
       FROM "health_imported_invoice_items" i
@@ -171,6 +310,9 @@ export class ReconciliationService {
       WHERE f."clientId" = ${clientId}
         AND f."mesReferencia" >= ${firstDayStr}::date
         AND f."mesReferencia" < (${firstDayStr}::date + INTERVAL '1 month')
+        ${insurerId
+          ? Prisma.sql`AND f."insurerId" = ${insurerId}`
+          : Prisma.sql`AND f."insurerId" IS NULL`}
     `);
 
     // 2) fallback: cabeçalho
@@ -184,6 +326,9 @@ export class ReconciliationService {
         WHERE f."clientId" = ${clientId}
           AND f."mesReferencia" >= ${firstDayStr}::date
           AND f."mesReferencia" < (${firstDayStr}::date + INTERVAL '1 month')
+          ${insurerId
+            ? Prisma.sql`AND f."insurerId" = ${insurerId}`
+            : Prisma.sql`AND f."insurerId" IS NULL`}
       `);
     }
 
@@ -201,14 +346,46 @@ export class ReconciliationService {
     // Beneficiários vigentes
     const ativos = await this.prisma.beneficiario.findMany({
       where: this.makeBenefWhereVigente(clientId, filters, start, next),
-      select: { id: true, nomeCompleto: true, cpf: true, valorMensalidade: true },
+      select: {
+        id: true, nomeCompleto: true, cpf: true, valorMensalidade: true, plano: true,
+        faixaEtaria: true, regimeCobranca: true, dataEntrada: true, dataSaida: true,
+      },
     });
 
-    const mapAtivos = new Map<string, { nome: string; mensalidade: number }>();
+    // === regras de seguradora: carregar e preparar ===
+    const rules = insurerId ? await this.loadActiveRules(insurerId, clientId, start, next) : [];
+    const planCache = new Map<string, string | null>();
+
+    const mapAtivos = new Map<string, { nome: string; mensalidade: number; adjusted: number }>();
     for (const b of ativos) {
       const cpf = (b.cpf ?? '').replace(/\D/g, '');
       if (!cpf) continue;
-      mapAtivos.set(cpf, { nome: b.nomeCompleto ?? '', mensalidade: this.toNum(b.valorMensalidade as any) });
+      const baseMens = this.toNum(b.valorMensalidade as any);
+
+      // tenta identificar planId (se houver seguradora no contexto)
+      const planId = insurerId ? await this.resolvePlanIdByNameCached(planCache, insurerId, b.plano) : undefined;
+
+      // escolhe regra mais específica
+      const rule = insurerId
+        ? this.pickBestRule(rules, {
+            clientId,
+            planId,
+            faixaEtaria: b.faixaEtaria ?? undefined,
+            regime: b.regimeCobranca ?? undefined,
+          })
+        : undefined;
+
+      const adjusted = rule
+        ? this.applyPolicy(
+            baseMens,
+            { dataEntrada: b.dataEntrada, dataSaida: b.dataSaida, regimeCobranca: b.regimeCobranca ?? null },
+            start,
+            next,
+            (rule.policy as any) as PolicyJson
+          )
+        : baseMens;
+
+      mapAtivos.set(cpf, { nome: b.nomeCompleto ?? '', mensalidade: baseMens, adjusted });
     }
     const ativosSet = new Set(mapAtivos.keys());
 
@@ -263,15 +440,18 @@ export class ReconciliationService {
         });
       }
 
-      const diffAbs = Math.abs(info.soma - ativo.mensalidade);
+      // compara com valor AJUSTADO pela regra (se houver)
+      const esperado = insurerId ? ativo.adjusted : ativo.mensalidade;
+
+      const diffAbs = Math.abs(info.soma - esperado);
       if (diffAbs > 0.009) {
         mismatched.push({
           id: info.ids[0] ?? `MIS:${cpf}`,
           cpf: this.maskCpf(cpf),
           nome: ativo.nome || info.nome || '—',
           valorCobrado: this.toBRL(info.soma),
-          valorMensalidade: this.toBRL(ativo.mensalidade),
-          diferenca: this.toBRL(info.soma - ativo.mensalidade),
+          valorMensalidade: this.toBRL(esperado),
+          diferenca: this.toBRL(info.soma - esperado),
         });
       } else {
         okSumNum += info.soma;
@@ -282,11 +462,12 @@ export class ReconciliationService {
     // Só no cadastro
     for (const [cpf, ativo] of mapAtivos.entries()) {
       if (!byCpf.has(cpf)) {
+        const esperado = insurerId ? ativo.adjusted : ativo.mensalidade;
         onlyInRegistry.push({
           id: `REG:${cpf}`,
           cpf: this.maskCpf(cpf),
           nome: ativo.nome || '—',
-          valorMensalidade: this.toBRL(ativo.mensalidade),
+          valorMensalidade: this.toBRL(esperado),
         });
       }
     }
@@ -295,7 +476,7 @@ export class ReconciliationService {
     for (const r of flatFatura) {
       if (anyFilter && !ativosSet.has(r.cpf)) continue;
       const ativo = mapAtivos.get(r.cpf);
-      const mensal = ativo ? ativo.mensalidade : NaN;
+      const mensal = ativo ? (insurerId ? ativo.adjusted : ativo.mensalidade) : NaN;
       const diff = ativo ? r.valor - mensal : NaN;
 
       const status: 'OK' | 'DIVERGENTE' | 'DUPLICADO' | 'SOFATURA' =
@@ -326,9 +507,13 @@ export class ReconciliationService {
     duplicates.sort(byNome);
     allInvoice.sort(byNome);
 
-    // status de fechamento
-    const existingClosure = await this.prisma.conciliacao.findUnique({
-      where: { clientId_mesReferencia: { clientId, mesReferencia: start } },
+    // status de fechamento — sensível a insurerId (opcional)
+    const existingClosure = await this.prisma.conciliacao.findFirst({
+      where: {
+        clientId,
+        mesReferencia: start,
+        ...(insurerId ? { insurerId } : { insurerId: null }),
+      },
       select: { status: true, totals: true, closedAt: true },
     });
 
@@ -381,16 +566,19 @@ export class ReconciliationService {
       format: 'xlsx' | 'csv';
       tab: 'mismatched' | 'onlyInInvoice' | 'onlyInRegistry' | 'duplicates' | 'all' | 'allInvoice';
       filters?: Filters;
+      insurerId?: string;
     },
   ): Promise<{ filename: string; contentType: string; buffer: Buffer }> {
     const payload = await this.buildReconciliation(clientId, {
       mesReferencia: opts.mesReferencia,
       filters: opts.filters,
+      insurerId: opts.insurerId,
     });
     const yyyymm = payload.mesReferencia.slice(0, 7);
 
     const sheetNameSuffix = () => {
       const parts: string[] = [];
+      if (opts.insurerId) parts.push(`seg_${opts.insurerId}`);
       if (opts.filters?.tipo) parts.push(`tipo_${opts.filters.tipo}`);
       if (opts.filters?.plano) parts.push(`plano_${opts.filters.plano}`);
       if (opts.filters?.centro) parts.push(`centro_${opts.filters.centro}`);
@@ -483,14 +671,15 @@ export class ReconciliationService {
   // ---------- Fechamento manual ----------
   async closeManual(
     clientId: string,
-    dto: { mes: string; totalFatura: number; observacoes?: string },
+    dto: { mes: string; totalFatura: number; observacoes?: string; insurerId?: string },
     actorId?: string,
   ) {
     const ym = this.ensureYYYYMM(dto.mes);
     const mesReferencia = this.firstDayUTC(ym);
+    const insurerId = dto.insurerId ?? undefined;
 
-    // snapshot
-    const payload = await this.buildReconciliation(clientId, { mesReferencia: ym });
+    // snapshot (sensível a insurerId)
+    const payload = await this.buildReconciliation(clientId, { mesReferencia: ym, insurerId });
 
     const totalsSnapshot: any = {
       ...payload.totals,
@@ -508,29 +697,48 @@ export class ReconciliationService {
       okCount: payload.totals.okCount,
     };
 
-    const conciliacao = await this.prisma.conciliacao.upsert({
-      where: { clientId_mesReferencia: { clientId, mesReferencia } },
-      create: {
+    // como a unique é (clientId, mesReferencia, insurerId) e insurerId pode ser NULL,
+    // evitamos upsert com where composto: usamos findFirst -> create/update
+    const existing = await this.prisma.conciliacao.findFirst({
+      where: {
         clientId,
         mesReferencia,
-        status: 'FECHADA',
-        totals: totalsSnapshot,
-        filtros: payload.filtersApplied as any,
-        counts: counts as any,
-        closedAt: new Date(),
-        closedBy: actorId ?? null,
-        createdBy: actorId ?? null,
+        ...(insurerId ? { insurerId } : { insurerId: null }),
       },
-      update: {
-        status: 'FECHADA',
-        totals: totalsSnapshot,
-        filtros: payload.filtersApplied as any,
-        counts: counts as any,
-        closedAt: new Date(),
-        closedBy: actorId ?? undefined,
-      },
-      select: { id: true, status: true, closedAt: true },
+      select: { id: true },
     });
+
+    let conciliacao;
+    if (!existing) {
+      conciliacao = await this.prisma.conciliacao.create({
+        data: {
+          clientId,
+          mesReferencia,
+          insurerId: insurerId ?? null,
+          status: 'FECHADA',
+          totals: totalsSnapshot,
+          filtros: payload.filtersApplied as any,
+          counts: counts as any,
+          closedAt: new Date(),
+          closedBy: actorId ?? null,
+          createdBy: actorId ?? null,
+        },
+        select: { id: true, status: true, closedAt: true },
+      });
+    } else {
+      conciliacao = await this.prisma.conciliacao.update({
+        where: { id: existing.id },
+        data: {
+          status: 'FECHADA',
+          totals: totalsSnapshot,
+          filtros: payload.filtersApplied as any,
+          counts: counts as any,
+          closedAt: new Date(),
+          closedBy: actorId ?? undefined,
+        },
+        select: { id: true, status: true, closedAt: true },
+      });
+    }
 
     return { ok: true, conciliacao };
   }
@@ -538,14 +746,19 @@ export class ReconciliationService {
   // ---------- Reabrir mês ----------
   async reopen(
     clientId: string,
-    dto: { mes: string },
+    dto: { mes: string; insurerId?: string },
     _actorId?: string,
   ) {
     const ym = this.ensureYYYYMM(dto.mes);
     const mesReferencia = this.firstDayUTC(ym);
+    const insurerId = dto.insurerId ?? undefined;
 
-    const conc = await this.prisma.conciliacao.findUnique({
-      where: { clientId_mesReferencia: { clientId, mesReferencia } },
+    const conc = await this.prisma.conciliacao.findFirst({
+      where: {
+        clientId,
+        mesReferencia,
+        ...(insurerId ? { insurerId } : { insurerId: null }),
+      },
       select: { id: true },
     });
     if (!conc) throw new NotFoundException('Fechamento não encontrado para este mês.');
@@ -569,6 +782,7 @@ export class ReconciliationService {
       limit?: number;
       status?: 'OPEN' | 'CLOSED';
       order?: 'asc' | 'desc';
+      insurerId?: string;
     },
   ): Promise<{
     ok: true;
@@ -608,7 +822,11 @@ export class ReconciliationService {
     const limit = Math.min(200, Math.max(1, opts?.limit ?? 24));
     const skip = (page - 1) * limit;
 
-    const where: Prisma.ConciliacaoWhereInput = { clientId };
+    const where: Prisma.ConciliacaoWhereInput = {
+      clientId,
+      ...(opts?.insurerId ? { insurerId: opts.insurerId } : {}),
+      ...(opts?.insurerId === undefined ? {} : {}), // apenas para clareza
+    };
     // período
     if (opts?.fromYM || opts?.toYM) {
       const gte = opts?.fromYM ? this.firstDayUTC(opts.fromYM) : undefined;
@@ -734,6 +952,7 @@ export class ReconciliationService {
       toYM?: string;
       status?: 'OPEN' | 'CLOSED';
       format: 'xlsx' | 'csv';
+      insurerId?: string;
     },
   ): Promise<{ filename: string; contentType: string; buffer: Buffer }> {
     const all = await this.listHistory(clientId, {
@@ -743,6 +962,7 @@ export class ReconciliationService {
       page: 1,
       limit: 1000,
       order: 'asc',
+      insurerId: opts.insurerId,
     });
 
     const rows = all.rows.map((r) => ({
@@ -772,7 +992,7 @@ export class ReconciliationService {
     if (opts.format === 'xlsx') {
       const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
       return {
-        filename: `faturamento_${clientId}_${opts.fromYM ?? ''}_${opts.toYM ?? ''}.xlsx`,
+        filename: `faturamento_${clientId}_${opts.fromYM ?? ''}_${opts.toYM ?? ''}${opts.insurerId ? `_seg_${opts.insurerId}` : ''}.xlsx`,
         contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         buffer: buf as Buffer,
       };
@@ -780,7 +1000,7 @@ export class ReconciliationService {
 
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'csv' });
     return {
-      filename: `faturamento_${clientId}_${opts.fromYM ?? ''}_${opts.toYM ?? ''}.csv`,
+      filename: `faturamento_${clientId}_${opts.fromYM ?? ''}_${opts.toYM ?? ''}${opts.insurerId ? `_seg_${opts.insurerId}` : ''}.csv`,
       contentType: 'text/csv; charset=utf-8',
       buffer: buf as Buffer,
     };

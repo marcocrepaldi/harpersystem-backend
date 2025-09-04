@@ -90,6 +90,105 @@ enum DocumentCategory {
   OUTRO
 }
 
+// ---------- RISCOS EMPRESARIAIS (NOVO) ----------
+enum RiskProjectStatus {
+  DRAFT
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
+
+enum RiskProjectCategory {
+  RC_GERAL
+  RC_PROFISSIONAL
+  RISCOS_ENGENHARIA
+  EQUIPAMENTOS
+  OBRA
+}
+
+enum RiskEquipmentStatus {
+  ACTIVE
+  UNDER_MAINTENANCE
+  INACTIVE
+  RETIRED
+  LOST
+}
+
+enum RiskEquipmentType {
+  MOBILE
+  FIXED
+}
+
+enum RiskCertificateStatus {
+  PENDING
+  VALID
+  EXPIRED
+  REJECTED
+}
+
+// ---------- FINANCEIRO RISCOS / APÓLICE (NOVO) ----------
+enum InstallmentStatus {
+  OPEN
+  PAID
+  OVERDUE
+  CANCELED
+}
+
+enum EndorsementType {
+  INCREASE
+  DECREASE
+  CANCELLATION
+  OTHER
+}
+
+enum CommissionOrigin {
+  HEALTH_RECONCILIATION
+  RISK_POLICY_INSTALLMENT
+  RISK_ENDORSEMENT_ADJUST
+}
+
+// ---------- NOVO: linhas de negócio da seguradora ----------
+enum InsuranceLine {
+  HEALTH
+  DENTAL
+  LIFE
+  P_AND_C // Property & Casualty (patrimoniais, RC, engenharia etc.)
+  OTHER
+}
+
+// ---------- NOVO: SEGURADORA / OPERADORA ----------
+model Insurer {
+  id        String          @id @default(cuid())
+  slug      String          @unique // ex.: "amil", "bradesco-saude"
+  legalName String // razão social
+  tradeName String // nome fantasia / brand
+  taxId     String?         @db.VarChar(32) // CNPJ
+  ansCode   String?         @db.VarChar(16) // registro ANS (saúde) quando aplicável
+  lines     InsuranceLine[] // ex.: [HEALTH, DENTAL]
+
+  isActive Boolean @default(true)
+  website  String?
+  meta     Json?
+
+  // back-relations nomeadas (evita ambiguidade)
+  healthPlans  HealthPlan[]         @relation("Insurer_HealthPlans")
+  policies     Policy[]             @relation("Insurer_Policies")
+  // 👇 back-relation novo
+  billingRules InsurerBillingRule[] @relation("Insurer_BillingRules")
+
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  FaturaImportada FaturaImportada[]
+  Conciliacao     Conciliacao[]
+
+  @@index([tradeName])
+  @@index([legalName])
+  @@index([taxId])
+  @@index([ansCode])
+  @@map("insurers")
+}
+
 // ---------- CORE ----------
 model Corretor {
   id         String   @id @default(cuid())
@@ -106,11 +205,17 @@ model Corretor {
 
   users           User[]
   clients         Client[]
-  policies        Policy[] @relation("PolicyCorretor")
+  policies        Policy[]         @relation("PolicyCorretor")
   commissionRules CommissionRule[] @relation("Corretor_CommissionRules")
 
-  // ---- NOVO: back-relation de documentos do corretor
-  documents       Document[]
+  // back-relation de documentos do corretor
+  documents Document[]
+
+  // back-relations de riscos
+  riskProjects       RiskProject[]
+  riskEquipments     RiskEquipment[]
+  riskCertificates   RiskCertificate[]
+  commissionReceipts CommissionReceipt[]
 }
 
 model User {
@@ -151,7 +256,7 @@ model Client {
   status     ClientStatus @default(ACTIVE)
 
   // LEGADO
-  tags       String[]     @default([])
+  tags String[] @default([])
 
   // endereço (legado)
   addressZip        String?
@@ -193,8 +298,8 @@ model Client {
   marketingOptIn Boolean @default(false)
   privacyConsent Json?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
   policies       Policy[]          @relation("PolicyClient")
@@ -217,11 +322,19 @@ model Client {
   importErrors BeneficiarioImportError[]
 
   // Conciliação / Comissões
-  conciliacoes     Conciliacao[]
-  comissoes        ComissaoLancamento[]
-  commissionRules  CommissionRule[] @relation("Client_CommissionRules")
+  conciliacoes    Conciliacao[]
+  comissoes       ComissaoLancamento[]
+  commissionRules CommissionRule[]     @relation("Client_CommissionRules")
 
-  // ---- NOVO: back-relation de documentos do cliente
+  // 👇 back-relation novo
+  billingRules InsurerBillingRule[] @relation("Client_BillingRules")
+
+  // back-relations de riscos
+  riskProjects     RiskProject[]
+  riskEquipments   RiskEquipment[]
+  riskCertificates RiskCertificate[]
+
+  // back-relation de documentos do cliente
   documents Document[]
 
   @@unique([corretorId, id])
@@ -240,37 +353,51 @@ model Policy {
   clientId   String
 
   corretor Corretor @relation("PolicyCorretor", fields: [corretorId], references: [id], onDelete: Cascade)
-  client   Client   @relation("PolicyClient",   fields: [corretorId, clientId], references: [corretorId, id], onDelete: Cascade)
+  client   Client   @relation("PolicyClient", fields: [corretorId, clientId], references: [corretorId, id], onDelete: Cascade)
 
   policyNumber String
-  insurer      String
-  product      String?
-  startDate    DateTime
-  endDate      DateTime?
-  premium      Decimal      @db.Decimal(12, 2)
-  status       PolicyStatus @default(DRAFT)
-  notes        String?
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
+
+  // LEGACY (Fase A – compatibilidade)
+  insurer String
+
+  // NEW (Fase A – backfill; depois substitui o string)
+  insurerId  String?
+  insurerRel Insurer? @relation("Insurer_Policies", fields: [insurerId], references: [id], onDelete: SetNull)
+
+  product   String?
+  startDate DateTime
+  endDate   DateTime?
+  premium   Decimal      @db.Decimal(12, 2)
+  status    PolicyStatus @default(DRAFT)
+  notes     String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  // back-relations (opcionais; podem existir em RiskProjectPolicy)
+  projectLinks       RiskProjectPolicy[]
+  ComissaoLancamento ComissaoLancamento[]
+  PolicyInstallment  PolicyInstallment[]
+  PolicyEndorsement  PolicyEndorsement[]
 
   @@unique([corretorId, policyNumber])
   @@index([corretorId, clientId])
   @@index([corretorId, status])
   @@index([corretorId, startDate])
+  @@index([insurerId]) // NEW
   @@map("policies")
 }
 
 // ---------- HEALTH ----------
 model RegraCobranca {
-  id                String   @id @default(cuid())
+  id                String @id @default(cuid())
   clientId          String
-  cliente           Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  cliente           Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
   descricao         String
   dataCorteCobranca Int
   policy            Json?
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   beneficiarios Beneficiario[]
 
@@ -279,12 +406,12 @@ model RegraCobranca {
 }
 
 model Beneficiario {
-  id         String   @id @default(cuid())
-  clientId   String
-  cliente    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  titularId  String?
-  titular      Beneficiario?  @relation("TitularDependentes", fields: [titularId], references: [id], onDelete: SetNull)
-  dependentes  Beneficiario[] @relation("TitularDependentes")
+  id          String         @id @default(cuid())
+  clientId    String
+  cliente     Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  titularId   String?
+  titular     Beneficiario?  @relation("TitularDependentes", fields: [titularId], references: [id], onDelete: SetNull)
+  dependentes Beneficiario[] @relation("TitularDependentes")
 
   nomeCompleto     String
   cpf              String?            @db.VarChar(14)
@@ -304,15 +431,15 @@ model Beneficiario {
   contrato         String?
   comentario       String?
 
-  regimeCobranca   RegimeCobranca?
-  motivoMovimento  MotivoMovimento?
-  observacoes      String?
+  regimeCobranca  RegimeCobranca?
+  motivoMovimento MotivoMovimento?
+  observacoes     String?
 
   regraCobrancaId String?
   regraCobranca   RegraCobranca? @relation(fields: [regraCobrancaId], references: [id], onDelete: SetNull)
 
   // back-relations
-  concItems ConciliacaoItem[]   @relation("Beneficiario_ConciliacaoItems")
+  concItems ConciliacaoItem[]    @relation("Beneficiario_ConciliacaoItems")
   comissoes ComissaoLancamento[] @relation("Beneficiario_ComissaoLancamentos")
 
   createdAt DateTime @default(now())
@@ -329,16 +456,16 @@ model Beneficiario {
 }
 
 model BeneficiarioImportError {
-  id         String   @id @default(cuid())
-  clientId   String
-  cliente    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  id       String @id @default(cuid())
+  clientId String
+  cliente  Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
   uploadedBy String?
   linha      Int
   motivo     String
   dados      Json
 
-  createdAt  DateTime  @default(now())
+  createdAt DateTime @default(now())
 
   @@index([clientId, createdAt])
   @@map("health_beneficiary_import_errors")
@@ -348,6 +475,10 @@ model FaturaImportada {
   id       String @id @default(cuid())
   clientId String
   cliente  Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // NOVO: operadora associada à fatura importada
+  insurerId String?
+  insurer   Insurer? @relation(fields: [insurerId], references: [id], onDelete: SetNull)
 
   mesReferencia             DateTime
   nomeBeneficiarioOperadora String?
@@ -360,37 +491,39 @@ model FaturaImportada {
   updatedAt DateTime @updatedAt
 
   // Detalhes / relações
-  itens      FaturaItem[]
-  concItems  ConciliacaoItem[] @relation("FaturaImportada_ConciliacaoItems")
+  itens     FaturaItem[]
+  concItems ConciliacaoItem[] @relation("FaturaImportada_ConciliacaoItems")
 
   @@index([clientId, mesReferencia])
+  @@index([insurerId])
+  @@index([clientId, mesReferencia, insurerId])
   @@map("health_imported_invoices")
 }
 
 model FaturaItem {
-  id       String @id @default(cuid())
+  id       String          @id @default(cuid())
   faturaId String
   fatura   FaturaImportada @relation(fields: [faturaId], references: [id], onDelete: Cascade)
 
-  contrato         String?
-  carteirinha      String?
-  nomeCompleto     String?
-  centroCusto      String?
-  sexo             String?
-  tipo             String?
-  estado           String?
-  cpf              String?     @db.VarChar(14)
-  dataNascimento   DateTime?
-  faixaEtaria      String?
-  dataEntrada      DateTime?
-  dataSaida        DateTime?
-  plano            String?
-  valorPlano       Decimal?    @db.Decimal(12, 2)
-  statusLinha      String?
-  credencial       String?     @db.VarChar(32)
-  regimeCobranca   RegimeCobranca?
-  motivoMovimento  MotivoMovimento?
-  observacoes      String?
+  contrato        String?
+  carteirinha     String?
+  nomeCompleto    String?
+  centroCusto     String?
+  sexo            String?
+  tipo            String?
+  estado          String?
+  cpf             String?          @db.VarChar(14)
+  dataNascimento  DateTime?
+  faixaEtaria     String?
+  dataEntrada     DateTime?
+  dataSaida       DateTime?
+  plano           String?
+  valorPlano      Decimal?         @db.Decimal(12, 2)
+  statusLinha     String?
+  credencial      String?          @db.VarChar(32)
+  regimeCobranca  RegimeCobranca?
+  motivoMovimento MotivoMovimento?
+  observacoes     String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -411,18 +544,26 @@ model HealthPlan {
   name     String
   isActive Boolean @default(true)
 
-  aliases          PlanAlias[]
-  prices           HealthPlanPrice[]
-  clients          ClientHealthPlan[]
+  // NEW (Phase A – opcional para backfill)
+  insurerId String?
+  insurer   Insurer? @relation("Insurer_HealthPlans", fields: [insurerId], references: [id], onDelete: SetNull)
+
+  aliases PlanAlias[]
+  prices  HealthPlanPrice[]
+  clients ClientHealthPlan[]
+
+  // 👇 back-relation novo
+  billingRules InsurerBillingRule[] @relation("Plan_BillingRules")
 
   // back-relations para regras e comissões
-  commissionRules  CommissionRule[]      @relation("HealthPlan_CommissionRules")
-  comissoes        ComissaoLancamento[]  @relation("HealthPlan_ComissaoLancamentos")
+  commissionRules CommissionRule[]     @relation("HealthPlan_CommissionRules")
+  comissoes       ComissaoLancamento[] @relation("HealthPlan_ComissaoLancamentos")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([name])
+  @@index([insurerId]) // NEW
   @@map("health_plans")
 }
 
@@ -438,14 +579,14 @@ model PlanAlias {
 }
 
 model HealthPlanPrice {
-  id             String         @id @default(cuid())
-  planId         String
-  plan           HealthPlan     @relation(fields: [planId], references: [id], onDelete: Cascade)
+  id     String     @id @default(cuid())
+  planId String
+  plan   HealthPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
 
   vigenciaInicio DateTime
   vigenciaFim    DateTime?
   faixaEtaria    String?
-  valor          Decimal        @db.Decimal(12, 2)
+  valor          Decimal         @db.Decimal(12, 2)
   regimeCobranca RegimeCobranca?
 
   createdAt DateTime @default(now())
@@ -481,7 +622,7 @@ model ClientHealthPlanPrice {
   vigenciaInicio DateTime
   vigenciaFim    DateTime?
   faixaEtaria    String?
-  valor          Decimal @db.Decimal(12, 2)
+  valor          Decimal         @db.Decimal(12, 2)
   regimeCobranca RegimeCobranca?
 
   createdAt DateTime @default(now())
@@ -492,11 +633,47 @@ model ClientHealthPlanPrice {
   @@map("client_health_plan_prices")
 }
 
+// ---------- NOVO: REGRAS DE COBRANÇA POR SEGURADORA (sem renomear tabelas existentes) ----------
+model InsurerBillingRule {
+  id String @id @default(cuid())
+
+  insurerId String
+  insurer   Insurer @relation("Insurer_BillingRules", fields: [insurerId], references: [id], onDelete: Cascade)
+
+  clientId String?
+  client   Client? @relation("Client_BillingRules", fields: [clientId], references: [id], onDelete: Cascade)
+
+  planId String?
+  plan   HealthPlan? @relation("Plan_BillingRules", fields: [planId], references: [id], onDelete: SetNull)
+
+  faixaEtaria String?
+  regime      RegimeCobranca?
+
+  // JSON com a política/regra da seguradora (ex.: arredondamento, cálculo por faixa, carência, etc.)
+  policy Json
+
+  isActive  Boolean   @default(true)
+  validFrom DateTime  @default(now())
+  validTo   DateTime?
+  version   Int       @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([insurerId, clientId, planId, faixaEtaria, regime, isActive, validFrom, validTo])
+  @@map("insurer_billing_rules")
+}
+
 // ---------- CONCILIAÇÃO ----------
 model Conciliacao {
-  id            String            @id @default(cuid())
-  clientId      String
-  client        Client            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // NOVO: operadora associada ao fechamento
+  insurerId String?
+  insurer   Insurer? @relation(fields: [insurerId], references: [id], onDelete: SetNull)
+
   mesReferencia DateTime
   status        ConciliacaoStatus @default(ABERTA)
 
@@ -505,8 +682,8 @@ model Conciliacao {
   filtros Json?
   counts  Json?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
   createdBy String?
   closedBy  String?
   closedAt  DateTime?
@@ -514,39 +691,42 @@ model Conciliacao {
   items     ConciliacaoItem[]
   comissoes ComissaoLancamento[]
 
-  @@unique([clientId, mesReferencia], name: "clientId_mesReferencia")
+  // IMPORTANTE: agora único por cliente + mês + seguradora
+  @@unique([clientId, mesReferencia, insurerId], name: "clientId_mesReferencia_insurerId")
+  @@index([clientId, mesReferencia])
   @@index([clientId, status, mesReferencia])
+  @@index([insurerId])
   @@map("reconciliation_runs")
 }
 
 model ConciliacaoItem {
-  id             String        @id @default(cuid())
-  conciliacaoId  String
-  conciliacao    Conciliacao   @relation(fields: [conciliacaoId], references: [id], onDelete: Cascade)
+  id            String      @id @default(cuid())
+  conciliacaoId String
+  conciliacao   Conciliacao @relation(fields: [conciliacaoId], references: [id], onDelete: Cascade)
 
-  faturaId       String?
-  fatura         FaturaImportada? @relation("FaturaImportada_ConciliacaoItems", fields: [faturaId], references: [id], onDelete: SetNull)
+  faturaId String?
+  fatura   FaturaImportada? @relation("FaturaImportada_ConciliacaoItems", fields: [faturaId], references: [id], onDelete: SetNull)
 
   beneficiarioId String?
-  beneficiario   Beneficiario?    @relation("Beneficiario_ConciliacaoItems", fields: [beneficiarioId], references: [id], onDelete: SetNull)
+  beneficiario   Beneficiario? @relation("Beneficiario_ConciliacaoItems", fields: [beneficiarioId], references: [id], onDelete: SetNull)
 
-  cpf            String? @db.VarChar(14)
-  nome           String?
+  cpf  String? @db.VarChar(14)
+  nome String?
 
-  valorCobrado   Decimal?      @db.Decimal(12, 2)
-  valorCadastro  Decimal?      @db.Decimal(12, 2)
-  diferenca      Decimal?      @db.Decimal(12, 2)
+  valorCobrado  Decimal? @db.Decimal(12, 2)
+  valorCadastro Decimal? @db.Decimal(12, 2)
+  diferenca     Decimal? @db.Decimal(12, 2)
 
   // 'OK' | 'DIVERGENTE' | 'DUPLICADO' | 'SOFATURA' | 'SOCADASTRO'
-  statusLinha    String
+  statusLinha String
 
-  plano          String?
-  centroCusto    String?
-  faixaEtaria    String?
-  regimeCobranca RegimeCobranca?
+  plano           String?
+  centroCusto     String?
+  faixaEtaria     String?
+  regimeCobranca  RegimeCobranca?
   motivoMovimento MotivoMovimento?
 
-  raw Json?
+  raw       Json?
   createdAt DateTime @default(now())
 
   @@index([conciliacaoId, statusLinha])
@@ -555,16 +735,16 @@ model ConciliacaoItem {
 
 // ---------- REGRAS DE COMISSÃO ----------
 model CommissionRule {
-  id             String          @id @default(cuid())
+  id String @id @default(cuid())
 
-  corretorId     String
-  corretor       Corretor        @relation("Corretor_CommissionRules", fields: [corretorId], references: [id], onDelete: Cascade)
+  corretorId String
+  corretor   Corretor @relation("Corretor_CommissionRules", fields: [corretorId], references: [id], onDelete: Cascade)
 
-  clientId       String?
-  client         Client?         @relation("Client_CommissionRules", fields: [clientId], references: [id], onDelete: SetNull)
+  clientId String?
+  client   Client? @relation("Client_CommissionRules", fields: [clientId], references: [id], onDelete: SetNull)
 
-  planId         String?
-  plan           HealthPlan?     @relation("HealthPlan_CommissionRules", fields: [planId], references: [id], onDelete: SetNull)
+  planId String?
+  plan   HealthPlan? @relation("HealthPlan_CommissionRules", fields: [planId], references: [id], onDelete: SetNull)
 
   faixaEtaria    String?
   regimeCobranca RegimeCobranca?
@@ -572,11 +752,11 @@ model CommissionRule {
   vigenciaInicio DateTime
   vigenciaFim    DateTime?
 
-  percent        Decimal?        @db.Decimal(7, 6)
-  valorFixo      Decimal?        @db.Decimal(12, 2)
-  baseSource     String?         // 'INVOICE' | 'CADASTRO' | 'MIN' | 'MAX' | 'ZERO_IF_MISMATCH'
+  percent    Decimal? @db.Decimal(7, 6)
+  valorFixo  Decimal? @db.Decimal(12, 2)
+  baseSource String? // 'INVOICE' | 'CADASTRO' | 'MIN' | 'MAX' | 'ZERO_IF_MISMATCH'
 
-  isActive       Boolean         @default(true)
+  isActive Boolean @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -587,35 +767,48 @@ model CommissionRule {
 
 // ---------- LANÇAMENTOS DE COMISSÃO ----------
 model ComissaoLancamento {
-  id             String          @id @default(cuid())
+  id String @id @default(cuid())
 
-  clientId       String
-  client         Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
-  conciliacaoId  String
-  conciliacao    Conciliacao     @relation(fields: [conciliacaoId], references: [id], onDelete: Cascade)
+  // agora opcional para suportar Riscos
+  conciliacaoId String?
+  conciliacao   Conciliacao? @relation(fields: [conciliacaoId], references: [id], onDelete: SetNull)
 
   beneficiarioId String?
-  beneficiario   Beneficiario?   @relation("Beneficiario_ComissaoLancamentos", fields: [beneficiarioId], references: [id], onDelete: SetNull)
+  beneficiario   Beneficiario? @relation("Beneficiario_ComissaoLancamentos", fields: [beneficiarioId], references: [id], onDelete: SetNull)
 
-  planId         String?
-  plan           HealthPlan?     @relation("HealthPlan_ComissaoLancamentos", fields: [planId], references: [id], onDelete: SetNull)
+  planId String?
+  plan   HealthPlan? @relation("HealthPlan_ComissaoLancamentos", fields: [planId], references: [id], onDelete: SetNull)
 
-  competencia    DateTime
-  base           Decimal         @db.Decimal(12, 2)
-  aliquota       Decimal?        @db.Decimal(7, 6)
-  valor          Decimal         @db.Decimal(12, 2)
+  // vínculos de Riscos
+  policyId            String?
+  policy              Policy?            @relation(fields: [policyId], references: [id], onDelete: SetNull)
+  policyInstallmentId String?
+  policyInstallment   PolicyInstallment? @relation(fields: [policyInstallmentId], references: [id], onDelete: SetNull)
+  origin              CommissionOrigin?
 
-  status         ComissaoStatus  @default(A_RECEBER)
-  dueDate        DateTime?
-  receivedAt     DateTime?
-  reference      Json?
+  competencia DateTime
+  base        Decimal  @db.Decimal(12, 2)
+  aliquota    Decimal? @db.Decimal(7, 6)
+  valor       Decimal  @db.Decimal(12, 2)
+
+  status     ComissaoStatus @default(A_RECEBER)
+  dueDate    DateTime?
+  receivedAt DateTime?
+  reference  Json?
+
+  // back-relation para recibos (itens)
+  receiptItems CommissionReceiptItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([clientId, competencia, status])
   @@index([conciliacaoId])
+  @@index([policyId])
+  @@index([policyInstallmentId])
   @@map("commission_accruals")
 }
 
@@ -663,12 +856,12 @@ model Contact {
 
 // ---------- SERVICES / TAGS ----------
 model Service {
-  id       String         @id @default(cuid())
-  slug     String         @unique
+  id       String  @id @default(cuid())
+  slug     String  @unique
   name     String
-  isActive Boolean        @default(true)
+  isActive Boolean @default(true)
 
-  clients  ClientService[]
+  clients ClientService[]
 
   @@index([slug], map: "idx_service_slug")
   @@index([name])
@@ -679,8 +872,8 @@ model ClientService {
   clientId  String
   serviceId String
 
-  client    Client  @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  client  Client  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
 
   @@id([clientId, serviceId])
   @@index([serviceId])
@@ -689,12 +882,12 @@ model ClientService {
 }
 
 model Tag {
-  id       String     @id @default(cuid())
-  slug     String     @unique
+  id       String  @id @default(cuid())
+  slug     String  @unique
   name     String
-  isActive Boolean    @default(true)
+  isActive Boolean @default(true)
 
-  clients  ClientTag[]
+  clients ClientTag[]
 
   @@index([name])
   @@map("tags")
@@ -704,8 +897,8 @@ model ClientTag {
   clientId String
   tagId    String
 
-  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  tag      Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
 
   @@id([clientId, tagId])
   @@index([tagId])
@@ -733,35 +926,301 @@ model AuditLog {
 
 // ---------- NOVO: DOCUMENTOS ----------
 model Document {
-  id          String   @id @default(cuid())
+  id String @id @default(cuid())
 
-  corretorId  String
-  clientId    String
-  policyId    String? // opcional: referência direta a Policy.id (quando fizer sentido)
+  corretorId String
+  clientId   String
+  policyId   String? // opcional: referência direta a Policy.id (não relacionada)
 
-  filename    String
-  mimeType    String
-  size        Int
-  category    DocumentCategory @default(ANEXO)
-  tags        String[]         @default([])
-  notes       String?
+  filename String
+  mimeType String
+  size     Int
+  category DocumentCategory @default(ANEXO)
+  tags     String[]         @default([])
+  notes    String?
 
-  storageKey  String   @unique // ex: s3://bucket/tenants/{corretorId}/clients/{clientId}/{uuid}
-  checksum    String?          // sha256 (opcional)
+  storageKey String  @unique // ex: s3://bucket/tenants/{corretorId}/clients/{clientId}/{uuid}
+  checksum   String? // sha256 (opcional)
 
-  createdBy   String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  deletedAt   DateTime?
+  createdBy String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
 
   // relações
   client   Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
   corretor Corretor @relation(fields: [corretorId], references: [id], onDelete: Cascade)
 
-  // NOTE: se quiser atrelar ao seguro, você pode futuramente criar:
-  // policy  Policy?  @relation(fields: [policyId], references: [id], onDelete: SetNull)
-  // e um @@index(policyId)
-
   @@index([corretorId, clientId, category, createdAt])
   @@map("documents")
+}
+
+// ---------- NOVO: RISCOS EMPRESARIAIS MODELOS ----------
+model RiskProject {
+  id String @id @default(cuid())
+
+  corretorId String
+  clientId   String
+  corretor   Corretor @relation(fields: [corretorId], references: [id], onDelete: Cascade)
+  client     Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  code        String?             @db.VarChar(32)
+  name        String
+  category    RiskProjectCategory
+  description String?
+
+  startDate DateTime
+  endDate   DateTime?
+  status    RiskProjectStatus @default(DRAFT)
+
+  totalInsuredValue Decimal? @db.Decimal(14, 2)
+  limitOfLiability  Decimal? @db.Decimal(14, 2)
+  deductible        Decimal? @db.Decimal(14, 2)
+  currency          String?  @default("BRL")
+  sublimits         Json?
+  notes             String?
+  meta              Json?
+
+  locations    RiskLocation[]
+  equipments   RiskEquipment[]
+  policies     RiskProjectPolicy[]
+  stakeholders RiskStakeholder[]
+  certificates RiskCertificate[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([corretorId, clientId, code])
+  @@index([corretorId, clientId, status])
+  @@index([corretorId, clientId, category])
+  @@index([corretorId, startDate])
+  @@map("risk_projects")
+}
+
+model RiskLocation {
+  id        String      @id @default(cuid())
+  projectId String
+  project   RiskProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  zip        String?
+  street     String?
+  number     String?
+  complement String?
+  district   String?
+  city       String?
+  state      String?
+  country    String? @default("BR")
+
+  latitude  Decimal? @db.Decimal(9, 6)
+  longitude Decimal? @db.Decimal(9, 6)
+
+  startDate DateTime?
+  endDate   DateTime?
+
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // back-relation para RiskEquipment.location
+  equipments RiskEquipment[]
+
+  @@index([projectId])
+  @@map("risk_project_locations")
+}
+
+model RiskEquipment {
+  id String @id @default(cuid())
+
+  corretorId String
+  clientId   String
+  corretor   Corretor @relation(fields: [corretorId], references: [id], onDelete: Cascade)
+  client     Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  projectId  String?
+  project    RiskProject?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  locationId String?
+  location   RiskLocation? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+
+  assetTag     String? @db.VarChar(64)
+  serial       String? @db.VarChar(64)
+  category     String
+  manufacturer String?
+  model        String?
+  year         Int?
+
+  type         RiskEquipmentType   @default(MOBILE)
+  status       RiskEquipmentStatus @default(ACTIVE)
+  valueInsured Decimal?            @db.Decimal(14, 2)
+  currency     String?             @default("BRL")
+
+  acquiredAt       DateTime?
+  retiredAt        DateTime?
+  lastInspectionAt DateTime?
+  nextInspectionAt DateTime?
+
+  notes String?
+  meta  Json?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([corretorId, clientId, assetTag])
+  @@index([corretorId, clientId, status])
+  @@index([corretorId, clientId, category])
+  @@index([projectId])
+  @@map("risk_equipments")
+}
+
+model RiskProjectPolicy {
+  id String @id @default(cuid())
+
+  projectId String
+  project   RiskProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  policyId String
+  policy   Policy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  role  String? // "PRINCIPAL", "ADICIONAL", etc.
+  notes String?
+
+  linkedAt   DateTime  @default(now())
+  unlinkedAt DateTime?
+
+  @@unique([projectId, policyId])
+  @@index([policyId])
+  @@map("risk_project_policies")
+}
+
+model RiskStakeholder {
+  id        String      @id @default(cuid())
+  projectId String
+  project   RiskProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  role     String
+  name     String
+  document String? @db.VarChar(32)
+  email    String? @db.Citext
+  phone    String? @db.VarChar(32)
+  notes    String?
+  meta     Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId, role])
+  @@map("risk_stakeholders")
+}
+
+model RiskCertificate {
+  id String @id @default(cuid())
+
+  corretorId String
+  clientId   String
+  corretor   Corretor @relation(fields: [corretorId], references: [id], onDelete: Cascade)
+  client     Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  projectId String?
+  project   RiskProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  status            RiskCertificateStatus @default(PENDING)
+  holderName        String
+  holderEmail       String?               @db.Citext
+  additionalInsured Boolean?
+  requirements      Json?
+
+  issuedAt  DateTime?
+  validFrom DateTime?
+  validTo   DateTime?
+
+  documentId String?
+  notes      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([corretorId, clientId, status])
+  @@index([projectId, status])
+  @@map("risk_certificates")
+}
+
+// ---------- NOVO: PARCELAS / ENDOSSOS / RECEBIMENTOS ----------
+model PolicyInstallment {
+  id       String @id @default(cuid())
+  policyId String
+  policy   Policy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  number      Int
+  dueDate     DateTime
+  amountGross Decimal  @db.Decimal(12, 2)
+  amountNet   Decimal? @db.Decimal(12, 2)
+  taxes       Decimal? @db.Decimal(12, 2)
+  fees        Decimal? @db.Decimal(12, 2)
+
+  status    InstallmentStatus @default(OPEN)
+  paidAt    DateTime?
+  reference Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accruals ComissaoLancamento[]
+
+  @@index([policyId, number])
+  @@index([dueDate, status])
+  @@map("policy_installments")
+}
+
+model PolicyEndorsement {
+  id       String @id @default(cuid())
+  policyId String
+  policy   Policy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  type        EndorsementType
+  effectiveAt DateTime
+  amountDelta Decimal         @db.Decimal(12, 2)
+  notes       String?
+  raw         Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([policyId, effectiveAt])
+  @@map("policy_endorsements")
+}
+
+model CommissionReceipt {
+  id         String   @id @default(cuid())
+  corretorId String
+  corretor   Corretor @relation(fields: [corretorId], references: [id], onDelete: Cascade)
+
+  paidAt    DateTime
+  amount    Decimal  @db.Decimal(12, 2)
+  currency  String   @default("BRL")
+  method    String?
+  reference String?
+  notes     String?
+
+  items CommissionReceiptItem[]
+
+  createdAt DateTime @default(now())
+
+  @@index([corretorId, paidAt])
+  @@map("commission_receipts")
+}
+
+model CommissionReceiptItem {
+  id        String            @id @default(cuid())
+  receiptId String
+  receipt   CommissionReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  accrualId String
+  accrual   ComissaoLancamento @relation(fields: [accrualId], references: [id], onDelete: Cascade)
+
+  amount Decimal @db.Decimal(12, 2)
+
+  @@unique([receiptId, accrualId])
+  @@index([accrualId])
+  @@map("commission_receipt_items")
 }
