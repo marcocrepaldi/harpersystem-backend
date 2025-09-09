@@ -1,39 +1,29 @@
 import { IsBoolean, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class UpsertClientPlanDto {
-  /** Plano a vincular ao cliente */
-  @IsString()
-  @IsNotEmpty()
+  @IsString() @IsNotEmpty()
   planId!: string;
 
-  @IsOptional()
-  @IsBoolean()
+  @IsOptional() @IsBoolean()
   isActive?: boolean;
 }
 
 export class CreateClientPlanPriceDto {
-  /** Plano vinculado (preenchido pela rota /clients/:clientId/plans/:planId/prices) */
-  @IsString()
-  @IsNotEmpty()
+  @IsString() @IsNotEmpty()
   planId!: string;
 
-  @IsString()
-  @IsNotEmpty()
-  vigenciaInicio!: string;
+  @IsString() @IsNotEmpty()
+  vigenciaInicio!: string;   // ← obrigatório de novo
 
-  @IsOptional()
-  @IsString()
+  @IsOptional() @IsString()
   vigenciaFim?: string;
 
-  @IsOptional()
-  @IsString()
+  @IsOptional() @IsString()
   faixaEtaria?: string;
 
-  @IsString()
-  @IsNotEmpty()
+  @IsString() @IsNotEmpty()
   valor!: string;
 
-  @IsOptional()
-  @IsString()
+  @IsOptional() @IsString()
   regimeCobranca?: 'MENSAL' | 'DIARIO';
 }

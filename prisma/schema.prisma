@@ -161,8 +161,8 @@ enum InsuranceLine {
 model Insurer {
   id        String          @id @default(cuid())
   slug      String          @unique // ex.: "amil", "bradesco-saude"
-  legalName String // razão social
-  tradeName String // nome fantasia / brand
+  legalName String          // razão social
+  tradeName String          // nome fantasia / brand
   taxId     String?         @db.VarChar(32) // CNPJ
   ansCode   String?         @db.VarChar(16) // registro ANS (saúde) quando aplicável
   lines     InsuranceLine[] // ex.: [HEALTH, DENTAL]
@@ -171,10 +171,9 @@ model Insurer {
   website  String?
   meta     Json?
 
-  // back-relations nomeadas (evita ambiguidade)
+  // back-relations nomeadas
   healthPlans  HealthPlan[]         @relation("Insurer_HealthPlans")
   policies     Policy[]             @relation("Insurer_Policies")
-  // 👇 back-relation novo
   billingRules InsurerBillingRule[] @relation("Insurer_BillingRules")
 
   createdAt       DateTime          @default(now())
@@ -326,7 +325,7 @@ model Client {
   comissoes       ComissaoLancamento[]
   commissionRules CommissionRule[]     @relation("Client_CommissionRules")
 
-  // 👇 back-relation novo
+  // Regras por seguradora
   billingRules InsurerBillingRule[] @relation("Client_BillingRules")
 
   // back-relations de riscos
@@ -383,7 +382,7 @@ model Policy {
   @@index([corretorId, clientId])
   @@index([corretorId, status])
   @@index([corretorId, startDate])
-  @@index([insurerId]) // NEW
+  @@index([insurerId])
   @@map("policies")
 }
 
@@ -438,6 +437,9 @@ model Beneficiario {
   regraCobrancaId String?
   regraCobranca   RegraCobranca? @relation(fields: [regraCobrancaId], references: [id], onDelete: SetNull)
 
+  // ===== Operadora/CSV (1:1 opcional) =====
+  operadora BeneficiarioOperadora?
+
   // back-relations
   concItems ConciliacaoItem[]    @relation("Beneficiario_ConciliacaoItems")
   comissoes ComissaoLancamento[] @relation("Beneficiario_ComissaoLancamentos")
@@ -453,6 +455,64 @@ model Beneficiario {
   @@index([clientId, centroCusto])
   @@index([clientId, dataEntrada])
   @@map("health_beneficiaries")
+}
+
+// ===== Operadora/CSV: manter datas como STRING para aceitar "dd/mm/yyyy" sem parse ISO =====
+model BeneficiarioOperadora {
+  id             String       @id @default(cuid())
+  beneficiarioId String       @unique
+  beneficiario   Beneficiario @relation(fields: [beneficiarioId], references: [id], onDelete: Cascade)
+
+  empresa                 String?   @map("Empresa")
+  cpfOperadora            String?   @map("Cpf")
+  usuario                 String?   @map("Usuario")
+  nomeSocial              String?   @map("Nm_Social")
+  estadoCivil             String?   @map("Estado_Civil")
+  dataNascimentoOperadora String?   @map("Data_Nascimento") // << String (não DateTime)
+  sexoOperadora           String?   @map("Sexo") @db.VarChar(1)
+  identidade              String?   @map("Identidade")
+  orgaoExpedidor          String?   @map("Orgao_Exp")
+  ufOrgao                 String?   @map("Uf_Orgao")
+  ufEndereco              String?   @map("Uf_Endereco")
+  cidade                  String?   @map("Cidade")
+  tipoLogradouro          String?   @map("Tipo_Logradouro")
+  logradouro              String?   @map("Logradouro")
+  numero                  String?   @map("Numero")
+  complemento             String?   @map("Complemento")
+  bairro                  String?   @map("Bairro")
+  cep                     String?   @map("Cep")
+  fone                    String?   @map("Fone")
+  celular                 String?   @map("Celular")
+  planoOperadora          String?   @map("Plano")
+  matriculaOperadora      String?   @map("Matricula")
+  filial                  String?   @map("Filial")
+  codigoUsuario           String?   @map("Codigo_Usuario")
+  dataAdmissao            String?   @map("Dt_Admissao")      // << String
+  codigoCongenere         String?   @map("Codigo_Congenere")
+  nomeCongenere           String?   @map("Nm_Congenere")
+  tipoUsuario             String?   @map("Tipo_Usuario")
+  nomeMae                 String?   @map("Nome_Mae")
+  pis                     String?   @map("Pis")
+  cns                     String?   @map("Cns")
+  ctps                    String?   @map("Ctps")
+  serieCtps               String?   @map("Serie_Ctps")
+  dataProcessamento       String?   @map("Data_Processamento") // << String
+  dataCadastro            String?   @map("Data_Cadastro")       // << String
+  unidade                 String?   @map("Unidade")
+  descricaoUnidade        String?   @map("Descricao_Unidade")
+  cpfDependente           String?   @map("Cpf_Dependente")
+  grauParentesco          String?   @map("Grau_Parentesco")
+  dataCasamento           String?   @map("Dt_Casamento")       // << String
+  nuRegistroPessoaNatural String?   @map("Nu_Registro_Pessoa_Natural")
+  cdTabela                String?   @map("Cd_Tabela")
+  empresaUtilizacao       String?   @map("Empresa_Utilizacao")
+  dataCancelamento        String?   @map("Dt_Cancelamento")    // << String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([beneficiarioId])
+  @@map("health_beneficiary_operator")
 }
 
 model BeneficiarioImportError {
@@ -544,7 +604,7 @@ model HealthPlan {
   name     String
   isActive Boolean @default(true)
 
-  // NEW (Phase A – opcional para backfill)
+  // NEW (opcional)
   insurerId String?
   insurer   Insurer? @relation("Insurer_HealthPlans", fields: [insurerId], references: [id], onDelete: SetNull)
 
@@ -552,10 +612,10 @@ model HealthPlan {
   prices  HealthPlanPrice[]
   clients ClientHealthPlan[]
 
-  // 👇 back-relation novo
+  // Regras por seguradora
   billingRules InsurerBillingRule[] @relation("Plan_BillingRules")
 
-  // back-relations para regras e comissões
+  // Regras de comissão / lançamentos
   commissionRules CommissionRule[]     @relation("HealthPlan_CommissionRules")
   comissoes       ComissaoLancamento[] @relation("HealthPlan_ComissaoLancamentos")
 
@@ -563,7 +623,7 @@ model HealthPlan {
   updatedAt DateTime @updatedAt
 
   @@index([name])
-  @@index([insurerId]) // NEW
+  @@index([insurerId])
   @@map("health_plans")
 }
 
@@ -633,7 +693,7 @@ model ClientHealthPlanPrice {
   @@map("client_health_plan_prices")
 }
 
-// ---------- NOVO: REGRAS DE COBRANÇA POR SEGURADORA (sem renomear tabelas existentes) ----------
+// ---------- NOVO: REGRAS DE COBRANÇA POR SEGURADORA ----------
 model InsurerBillingRule {
   id String @id @default(cuid())
 
@@ -691,7 +751,7 @@ model Conciliacao {
   items     ConciliacaoItem[]
   comissoes ComissaoLancamento[]
 
-  // IMPORTANTE: agora único por cliente + mês + seguradora
+  // Único por cliente + mês + seguradora
   @@unique([clientId, mesReferencia, insurerId], name: "clientId_mesReferencia_insurerId")
   @@index([clientId, mesReferencia])
   @@index([clientId, status, mesReferencia])
@@ -1223,4 +1283,15 @@ model CommissionReceiptItem {
   @@unique([receiptId, accrualId])
   @@index([accrualId])
   @@map("commission_receipt_items")
+}
+
+model ImportRun {
+  id       String  @id @default(cuid())
+  clientId String
+  runId    String? @unique
+  latest   Boolean @default(false)
+  payload  Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

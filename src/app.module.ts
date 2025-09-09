@@ -43,7 +43,8 @@ import { InsurerBillingRulesModule } from './insurer-billing-rules/insurer-billi
     ImportErrorsModule,
     DocumentsModule,
     InsurersModule,
-    InsurerBillingRulesModule
+    InsurerBillingRulesModule,
+    ImportErrorsModule
   ],
   controllers: [AppController],
   providers: [

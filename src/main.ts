@@ -2,6 +2,7 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { Logger, ValidationPipe } from '@nestjs/common';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 // import helmet from 'helmet'; // recomendado em produção
 import { json, urlencoded } from 'express';
 import compression from 'compression';
@@ -28,8 +29,8 @@ async function bootstrap() {
   app.use(compression());
 
   // trust proxy (se estiver atrás de proxy/ingress)
-  if (process.env.TRUST_PROXY?.toLowerCase() === 'true') {
-    // @ts-ignore
+  if ((process.env.TRUST_PROXY ?? '').toLowerCase() === 'true') {
+    // @ts-expect-error: prop de express não tipada no Nest
     app.set('trust proxy', 1);
   }
 
@@ -66,12 +67,15 @@ async function bootstrap() {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    // ⬇️ Inclui X-Requested-With para destravar o preflight do login
     allowedHeaders: [
       'Content-Type',
       'Authorization',
       'x-tenant-subdomain',
       'x-tenant-slug',
       'x-tenant-code',
+      'X-Requested-With',   // <- aqui
+      'x-requested-with',   // (case-insensitive por garantia)
     ],
     exposedHeaders: ['Content-Disposition'],
     maxAge: 600,
@@ -83,19 +87,60 @@ async function bootstrap() {
   // }
 
   // Validação global (sem refletir payload gigante em erros)
-app.useGlobalPipes(
-  new ValidationPipe({
-    whitelist: true,
-    forbidNonWhitelisted: true,
-    transform: true,
-    transformOptions: { enableImplicitConversion: true },
-    // evita refletir payload (value/target) — não manda base64 nos erros de DTO
-    validationError: { target: false, value: false },
-  }),
-);
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+      transformOptions: { enableImplicitConversion: true },
+      // evita refletir payload (value/target) — não manda base64 nos erros de DTO
+      validationError: { target: false, value: false },
+    }),
+  );
 
   // Filtro global para sanitizar respostas de erro (remove base64/strings enormes)
   app.useGlobalFilters(new RedactExceptionFilter());
+
+  // ---------- Swagger (opcional; ligado por padrão em dev) ----------
+  const enableSwagger =
+    (process.env.ENABLE_SWAGGER ?? (isProd ? 'false' : 'true')).toLowerCase() === 'true';
+
+  if (enableSwagger) {
+    const cfg = new DocumentBuilder()
+      .setTitle(process.env.SWAGGER_TITLE ?? 'Harper API')
+      .setDescription(
+        process.env.SWAGGER_DESCRIPTION ?? 'Documentação da API (rotas usam prefixo global).',
+      )
+      .setVersion(process.env.SWAGGER_VERSION ?? '1.0.0')
+      .addBearerAuth(
+        {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+          description: 'Informe o token no formato: Bearer <token>',
+        },
+        'bearer',
+      )
+      .addServer(`/${prefix}`, 'Base com prefixo global')
+      .build();
+
+    const document = SwaggerModule.createDocument(app, cfg, { deepScanRoutes: true });
+
+    const docsMount = String(process.env.SWAGGER_PATH ?? 'docs').replace(/^\/+/, '');
+    SwaggerModule.setup(docsMount, app, document, {
+      useGlobalPrefix: true, // UI em /{prefix}/{docsMount}
+      swaggerOptions: {
+        persistAuthorization: true,
+        tagsSorter: 'alpha',
+        operationsSorter: 'alpha',
+        docExpansion: 'list',
+      },
+      customSiteTitle: process.env.SWAGGER_SITE_TITLE ?? 'Harper API Docs',
+    });
+
+    logger.log(`Swagger docs:  http://localhost:${port}/${prefix}/${docsMount}`);
+    logger.log(`Swagger JSON:  http://localhost:${port}/${prefix}/${docsMount}-json`);
+  }
 
   // Encerramento gracioso
   app.enableShutdownHooks();

@@ -1,25 +1,12 @@
 import {
-  IsOptional,
-  IsInt,
-  Min,
-  Max,
-  IsEnum,
-  IsString,
-  IsBoolean,
-  IsIn,
+  IsOptional, IsInt, Min, Max, IsEnum, IsString, IsBoolean, IsIn,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
-import { BeneficiarioTipo, BeneficiarioStatus } from '@prisma/client';
+import { BeneficiarioStatus } from '@prisma/client';
 
-/* ===================== Helpers ===================== */
 const normalizeStr = (v: unknown): string | undefined => {
   if (v == null) return undefined;
-  const s = String(v)
-    .trim()
-    // remove acentos para aceitar CÔNJUGE/conjuge etc.
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toUpperCase();
+  const s = String(v).trim().normalize('NFD').replace(/\p{Diacritic}/gu, '').toUpperCase();
   return s.length ? s : undefined;
 };
 
@@ -50,16 +37,13 @@ const toBool = (v: unknown): boolean | undefined => {
   if (typeof v === 'boolean') return v;
   if (v === 1 || v === '1') return true;
   if (v === 0 || v === '0') return false;
-  const s = String(v ?? '')
-    .trim()
-    .toLowerCase();
+  const s = String(v ?? '').trim().toLowerCase();
   if (!s) return undefined;
   if (['true', 't', 'yes', 'y', 'on', 'sim'].includes(s)) return true;
   if (['false', 'f', 'no', 'n', 'off', 'nao', 'não'].includes(s)) return false;
   return undefined;
 };
 
-/* ===================== DTO ===================== */
 export class FindBeneficiariesQueryDto {
   @IsOptional()
   @Type(() => Number)
@@ -74,14 +58,10 @@ export class FindBeneficiariesQueryDto {
   @Max(1000)
   limit?: number;
 
-  /**
-   * Aceita "TITULAR", "FILHO", "CONJUGE" e o legado "DEPENDENTE".
-   * (No service você pode mapear "DEPENDENTE" para [FILHO, CONJUGE] se desejar.)
-   */
   @IsOptional()
   @Transform(({ value }) => normalizeTipo(value))
   @IsIn(['TITULAR', 'FILHO', 'CONJUGE', 'DEPENDENTE'])
-  tipo?: BeneficiarioTipo | 'DEPENDENTE';
+  tipo?: 'TITULAR' | 'FILHO' | 'CONJUGE' | 'DEPENDENTE';
 
   @IsOptional()
   @Transform(({ value }) => normalizeStatus(value))

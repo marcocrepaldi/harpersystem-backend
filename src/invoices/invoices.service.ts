@@ -4,15 +4,6 @@ import * as Papa from 'papaparse';
 import * as xlsx from 'xlsx';
 import { listImportedInvoicesDTO, reconcileInvoicesDTO } from './dto/invoices.dto';
 
-/**
- * Serviço de importação/consulta de faturas.
- * - Lê CSV/XLS/XLSX
- * - Normaliza cabeçalhos (sem acento/espacos)
- * - Converte valores monetários de forma resiliente
- * - Filtra por coluna "credencial" mantendo apenas linhas cujo prefixo é "0TATM"
- * - Grava em "health_imported_invoices" (tabela FaturaImportada), 1 linha/beneficiário
- * - Suporte multi-operadora (insurerId opcional)
- */
 @Injectable()
 export class InvoicesService {
   constructor(private readonly prisma: PrismaService) {}
@@ -20,7 +11,6 @@ export class InvoicesService {
   /* ----------------------------- helpers ---------------------------------- */
 
   private decodeSmart(buf: Buffer): { text: string; encoding: 'utf-8' | 'latin1' } {
-    // tenta UTF-8; se houver muitos caracteres de substituição (�), volta para latin1
     const utf8 = buf.toString('utf-8');
     const repl = (utf8.match(/\uFFFD/g) || []).length;
     if (repl <= 2) return { text: utf8, encoding: 'utf-8' };
@@ -39,14 +29,7 @@ export class InvoicesService {
       .replace(/[\s._-]+/g, '');
   }
 
-  /**
-   * Converte valores monetários em BR para número.
-   * Aceita:
-   *  - "R$ 29.781,00" -> 29781
-   *  - "29781"        -> 297.81 (interpreta como centavos)
-   *  - "29,781.00"    -> 29781
-   *  - "(123,45)"     -> -123.45
-   */
+  /** Converte valores BR/US e parênteses negativos. */
   private toNumberSmart(raw: any): number {
     if (raw == null) return NaN;
     if (typeof raw === 'number') return raw;
@@ -59,22 +42,19 @@ export class InvoicesService {
     const negative = /^\(.*\)$/.test(s);
     if (negative) s = s.slice(1, -1);
 
-    // só dígitos -> assume centavos quando >= 3 dígitos
+    // só dígitos: assume centavos se >= 3 dígitos
     if (/^\d+$/.test(s)) {
       const n = Number(s);
       const val = s.length >= 3 ? n / 100 : n;
       return negative ? -val : val;
     }
 
-    // heurística de separadores
+    // heurística separadores
     if (s.includes(',') && s.includes('.')) {
       const lastComma = s.lastIndexOf(',');
       const lastDot = s.lastIndexOf('.');
-      if (lastComma > lastDot) {
-        s = s.replace(/\./g, '').replace(',', '.'); // BR
-      } else {
-        s = s.replace(/,/g, ''); // US
-      }
+      if (lastComma > lastDot) s = s.replace(/\./g, '').replace(',', '.');
+      else s = s.replace(/,/g, '');
     } else {
       if (/,/.test(s)) s = s.replace(/\./g, '').replace(',', '.');
       else s = s.replace(/,/g, '');
@@ -130,12 +110,59 @@ export class InvoicesService {
     return (v || '').replace(/\D/g, '').slice(0, 11);
   }
 
+  /** Filtro estrito por credencial: allow por prefixo, deny por prefixos proibidos + scan de tokens 0TA*** */
+  private matchesCredentialStrict(
+    rec: Record<string, any>,
+    allowedPrefix: string,
+    aliases: string[],
+  ): boolean {
+    const norm = (v: any) => String(v ?? '').trim().toUpperCase();
+    const ALLOWED = norm(allowedPrefix);
+    const DENY = (process.env.INVOICE_CREDENTIAL_DENY_PREFIXES || '')
+      .split(',')
+      .map((s) => norm(s))
+      .filter(Boolean);
+
+    // candidatos pelos aliases
+    const fromAliases = aliases
+      .map((a) => rec[a])
+      .filter((v) => v !== undefined && String(v).trim() !== '')
+      .map(norm);
+
+    // scan geral por tokens 0TAxxx (0TATM, 0TAYS etc.)
+    const tokenRe = /\b0TA[A-Z0-9]+/g;
+    const fromScan: string[] = [];
+    for (const v of Object.values(rec)) {
+      const s = norm(v);
+      if (!s) continue;
+      const m = s.match(tokenRe);
+      if (m) fromScan.push(...m.map(norm));
+    }
+
+    const candidates = [...new Set([...fromAliases, ...fromScan])];
+    if (candidates.length === 0) return false;
+
+    // deny: se qualquer candidato tem prefixo proibido -> rejeita
+    if (DENY.length && candidates.some((c) => DENY.some((d) => c.startsWith(d)))) {
+      return false;
+    }
+
+    // allow: precisa ter ao menos um com o prefixo permitido
+    if (candidates.some((c) => c.startsWith(ALLOWED))) return true;
+
+    // se apareceu algum 0TA***, mas diferente do permitido, rejeita
+    if (candidates.some((c) => /^0TA[A-Z0-9]+/.test(c))) return false;
+
+    // sem 0TA***, rejeita por segurança
+    return false;
+  }
+
   /* ------------------------------- main ------------------------------------ */
 
   /**
    * Importa arquivo e grava em FaturaImportada (1 linha/beneficiário).
-   * Filtra por credencial começando com 0TATM, economizando memória.
-   * Suporta `insurerId` (se informado, sobrescreve apenas daquele mês/operadora).
+   * Filtra por credencial com regra estrita (allow/deny).
+   * Deduplica por CPF priorizando a linha de valor 0.
    */
   async processInvoiceUpload(
     clientId: string,
@@ -208,7 +235,7 @@ export class InvoicesService {
       'credencial',
       'cdcredencial',
       'cred',
-      'carteirinha', // alguns layouts usam o mesmo campo; mantemos por segurança
+      'carteirinha',
     ].map((k) => this.normalizeKey(k));
 
     const pick = (obj: Record<string, any>, aliases: string[]) => {
@@ -222,7 +249,6 @@ export class InvoicesService {
 
     const REQUIRED_PREFIX = (process.env.INVOICE_CREDENTIAL_PREFIX || '0TATM').toUpperCase();
 
-    // queremos só essas chaves para reduzir custo de normalização
     const NEEDED_KEYS = new Set([
       ...NAME_ALIASES,
       ...CPF_ALIASES,
@@ -239,14 +265,10 @@ export class InvoicesService {
       return out;
     };
 
-    const matchesCredential = (rec: Record<string, any>) => {
-      const cred = pick(rec, CREDENCIAL_ALIASES);
-      if (!cred) return false;
-      const prefix = String(cred).trim().toUpperCase();
-      return prefix.startsWith(REQUIRED_PREFIX);
-    };
+    const matchesCredential = (rec: Record<string, any>) =>
+      this.matchesCredentialStrict(rec, REQUIRED_PREFIX, CREDENCIAL_ALIASES);
 
-    // leitura + filtro imediato
+    // leitura + filtro
     let kept: Record<string, any>[] = [];
     let totalRows = 0;
 
@@ -262,7 +284,6 @@ export class InvoicesService {
         const firstLine = content.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
         const delimiter = this.detectDelimiter(firstLine);
 
-        // filtra durante o parsing (não materializa tudo)
         Papa.parse(content, {
           header: true,
           skipEmptyLines: true,
@@ -284,7 +305,6 @@ export class InvoicesService {
         if (!ref) throw new BadRequestException('Intervalo da planilha não encontrado.');
         const range = xlsx.utils.decode_range(ref);
 
-        // detecta a linha de header (heurística semelhante ao CSV)
         const norm = (t: any) =>
           String(t ?? '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
         const tokens = [
@@ -316,21 +336,18 @@ export class InvoicesService {
           if (score >= 3) break;
         }
 
-        // headers normalizados por coluna (de s.c..e.c)
         const headers: string[] = [];
         for (let c = range.s.c; c <= range.e.c; c++) {
           const cell = sheet[xlsx.utils.encode_cell({ r: headerRow, c })];
           headers.push(this.normalizeKey(String(cell?.v ?? '')));
         }
 
-        // mapeia apenas colunas de interesse
         const colToKey = new Map<number, string>();
         for (let idx = 0; idx < headers.length; idx++) {
           const key = headers[idx];
           if (NEEDED_KEYS.has(key)) colToKey.set(idx, key);
         }
 
-        // varre linhas abaixo do header
         for (let r = headerRow + 1; r <= range.e.r; r++) {
           const rec: Record<string, any> = {};
           let hasAny = false;
@@ -361,27 +378,19 @@ export class InvoicesService {
 
     const dropped = Math.max(0, totalRows - kept.length);
 
-    // mês de referência = 1º dia UTC do mês atual
-    const now = new Date();
-    const mesReferencia = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0),
-    );
+    // ====== PREPARO + DEDUP POR CPF ======
+    type Prepared = {
+      rec: Record<string, any>;
+      cpf: string;
+      key: string;          // = cpf
+      nome: any;
+      rawValor: any;
+      parsedValor: number;  // vazio/NaN -> 0
+      isDuplicate: boolean;
+    };
 
-    // gravação
-    let processedCount = 0;
-
-    await this.prisma.$transaction(async (tx) => {
-      // sobrescreve importações do mesmo mês/cliente
-      // se insurerId informado -> apaga só daquela operadora; senão, apaga as que não têm operadora (NULL)
-      await tx.faturaImportada.deleteMany({
-        where: {
-          clientId,
-          mesReferencia,
-          ...(insurerId ? { insurerId } : { insurerId: null }),
-        },
-      });
-
-      for (const rec of kept) {
+    const prepared: Prepared[] = kept
+      .map((rec) => {
         const nome = ((): any => {
           for (const a of NAME_ALIASES) if (rec[a] != null && String(rec[a]).trim() !== '') return rec[a];
           return undefined;
@@ -395,36 +404,88 @@ export class InvoicesService {
           return undefined;
         })();
 
-        if (!cpfRaw) continue;
-
+        if (!cpfRaw) return null;
         const cpf = this.cleanCPF(String(cpfRaw));
-        if (cpf.length !== 11) continue;
+        if (cpf.length !== 11) return null;
 
-        const valor =
-          valorRaw == null || String(valorRaw).trim() === ''
-            ? null
-            : this.toNumberSmart(valorRaw);
+        // vazio/NaN -> 0
+        let parsed = 0;
+        if (!(valorRaw == null || String(valorRaw).trim() === '')) {
+          const n = this.toNumberSmart(valorRaw);
+          parsed = Number.isNaN(n) ? 0 : n;
+        }
 
+        const key = cpf;
+
+        return {
+          rec,
+          cpf,
+          key,
+          nome,
+          rawValor: valorRaw,
+          parsedValor: parsed,
+          isDuplicate: false,
+        } as Prepared;
+      })
+      .filter((p): p is Prepared => !!p);
+
+    // Grupos por CPF; manter 1 linha com valor === 0 se existir; senão a primeira.
+    const groups = new Map<string, Prepared[]>();
+    for (const p of prepared) {
+      if (!groups.has(p.key)) groups.set(p.key, []);
+      groups.get(p.key)!.push(p);
+    }
+
+    for (const arr of groups.values()) {
+      let primaryIndex = arr.findIndex((x) => x.parsedValor === 0);
+      if (primaryIndex === -1) primaryIndex = 0;
+
+      arr.forEach((x, idx) => {
+        if (idx !== primaryIndex) {
+          x.isDuplicate = true;
+          x.parsedValor = 0;
+          x.rec._duplicate = true;
+        }
+      });
+    }
+
+    // mês de referência = 1º dia UTC do mês atual
+    const now = new Date();
+    const mesReferencia = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0),
+    );
+
+    // gravação
+    let processedCount = 0;
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.faturaImportada.deleteMany({
+        where: {
+          clientId,
+          mesReferencia,
+          ...(insurerId ? { insurerId } : { insurerId: null }),
+        },
+      });
+
+      for (const p of prepared) {
         await tx.faturaImportada.create({
           data: {
             cliente: { connect: { id: clientId } },
-            // ✅ usa relação "insurer" quando informado (em vez de insurerId direto)
             ...(insurerId ? { insurer: { connect: { id: insurerId } } } : {}),
             mesReferencia,
-            nomeBeneficiarioOperadora: (nome ?? '').toString() || null,
-            cpfBeneficiarioOperadora: cpf,
-            valorCobradoOperadora: valor === null || Number.isNaN(valor) ? null : valor,
+            nomeBeneficiarioOperadora: (p.nome ?? '').toString() || null,
+            cpfBeneficiarioOperadora: p.cpf,
+            valorCobradoOperadora: p.parsedValor, // deduplicado (duplicados = 0)
             statusConciliacao: 'pendente',
-            raw: rec,
+            raw: p.rec,
           },
         });
-
         processedCount++;
       }
     });
 
     const detect = (aliases: string[]) =>
-      kept[0] ? aliases.find((a) => kept[0][a] !== undefined) ?? null : null;
+      prepared[0]?.rec ? aliases.find((a) => prepared[0]!.rec[a] !== undefined) ?? null : null;
 
     return {
       message: 'Fatura importada com sucesso.',
@@ -438,6 +499,10 @@ export class InvoicesService {
         valor: detect(VALOR_ALIASES),
         credencial: detect(CREDENCIAL_ALIASES),
       },
+      dedup: {
+        grupos: groups.size,
+        duplicados: prepared.filter((p) => p.isDuplicate).length,
+      },
       mesReferencia: `${mesReferencia.getUTCFullYear()}-${String(
         mesReferencia.getUTCMonth() + 1,
       ).padStart(2, '0')}`,
@@ -447,7 +512,7 @@ export class InvoicesService {
 
   /**
    * Lista faturas importadas do mês, com paginação e (opcional) busca simples.
-   * Se `insurerId` for informado, filtra por operadora; caso contrário, traz todas (independente de operadora).
+   * Se `insurerId` for informado, filtra por operadora; caso contrário, traz todas.
    */
   async listImported(
     clientId: string,
@@ -466,7 +531,7 @@ export class InvoicesService {
     const whereBase = {
       clientId,
       mesReferencia: { gte: startDate, lt: endDate },
-      ...(insurerId ? { insurerId } : {}), // ✅ filtro opcional por operadora
+      ...(insurerId ? { insurerId } : {}),
       ...(search
         ? {
             OR: [
@@ -503,17 +568,9 @@ export class InvoicesService {
     };
   }
 
-  /**
-   * Remove importações do mês/cliente.
-   * Se `insurerId` for informado, apaga apenas daquela operadora; senão, apaga todas as importações do mês.
-   */
+  /** Remove importações do mês/cliente (opcionalmente por operadora). */
   async deleteInvoiceByMonth(clientId: string, mesReferencia: Date, insurerId?: string) {
-    const where = {
-      clientId,
-      mesReferencia,
-      ...(insurerId ? { insurerId } : {}), // ✅ condicional
-    };
-
+    const where = { clientId, mesReferencia, ...(insurerId ? { insurerId } : {}) };
     const { count } = await this.prisma.faturaImportada.deleteMany({ where });
     return {
       message: `Foram deletadas ${count} faturas do mês de referência${insurerId ? ` (operadora ${insurerId})` : ''}.`,
@@ -521,9 +578,7 @@ export class InvoicesService {
     };
   }
 
-  /**
-   * Marca um conjunto de linhas como conciliadas (usado pelo botão "Marcar como Conciliado").
-   */
+  /** Marca um conjunto de linhas como conciliadas. */
   async reconcileByIds(clientId: string, invoiceIds: string[]) {
     if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
       throw new BadRequestException('Informe pelo menos 1 ID de fatura para conciliar.');
@@ -540,11 +595,7 @@ export class InvoicesService {
     };
   }
 
-  /**
-   * Wrapper para compatibilidade com o controller novo.
-   * - Se vier invoiceIds => delega para reconcileByIds (legado).
-   * - Caso contrário, lança erro (fechamento/evolução ficam no ReconciliationService).
-   */
+  /** Wrapper legado. */
   async reconcile(clientId: string, body: reconcileInvoicesDTO) {
     if (Array.isArray(body?.invoiceIds) && body.invoiceIds.length > 0) {
       return this.reconcileByIds(clientId, body.invoiceIds);

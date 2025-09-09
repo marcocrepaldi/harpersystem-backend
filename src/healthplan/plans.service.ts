@@ -64,6 +64,15 @@ export class PlansService {
       .trim()
       .toLowerCase();
 
+    // a unique é composta (planId + alias) => não dá para usar findUnique só com alias
+    const existsForPlan = await this.prisma.planAlias.findFirst({
+      where: { planId, alias: aliasNorm },
+      select: { id: true },
+    });
+    if (existsForPlan) {
+      throw new BadRequestException('Alias já cadastrado para este plano.');
+    }
+
     return this.prisma.planAlias.create({
       data: { planId, alias: aliasNorm },
     });

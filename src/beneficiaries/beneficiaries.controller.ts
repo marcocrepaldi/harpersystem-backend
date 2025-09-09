@@ -1,101 +1,128 @@
-// src/beneficiaries/beneficiaries.controller.ts
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import {
   Controller,
   Get,
   Post,
-  Patch,
-  Delete,
   Param,
   Query,
   Body,
+  DefaultValuePipe,
+  ParseIntPipe,
   UseInterceptors,
   UploadedFile,
-  HttpCode,
+  Delete,
+  Patch,
+  BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-
 import { BeneficiariesService } from './beneficiaries.service';
-import { FindBeneficiariesQueryDto } from './dto/find-beneficiaries.dto';
-import { CreateBeneficiaryDto } from './dto/create-beneficiary.dto';
-import { DeleteManyDto } from './dto/delete-many.dto';
-import { UpdateBeneficiaryDto } from './dto/update-beneficiary.dto';
-import { ParseCuidPipe } from '../common/pipes/parse-cuid.pipe';
+
+type PageResult<T> = { items: T[]; page: number; limit: number; total: number };
 
 @Controller('clients/:clientId/beneficiaries')
 export class BeneficiariesController {
-  constructor(private readonly beneficiariesService: BeneficiariesService) {}
+  constructor(private readonly svc: BeneficiariesService) {}
 
-  /** Lista beneficiários com filtros e agora exibe todos por padrão. */
+  // ================== LISTAGEM ==================
   @Get()
-  findMany(
-    @Param('clientId', ParseCuidPipe) clientId: string,
-    @Query() query: FindBeneficiariesQueryDto,
-  ) {
-    const queryWithAll = { ...query, all: true };
-    return this.beneficiariesService.findMany(clientId, queryWithAll);
+  async list(
+    @Param('clientId') clientId: string,
+    @Query('search') search?: string,
+    @Query('tipo') tipo?: string,
+    @Query('status') status?: string,
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page = 1,
+    @Query('limit', new DefaultValuePipe(1000), ParseIntPipe) limit = 1000,
+  ): Promise<PageResult<any>> {
+    return this.svc.list(clientId, { search, tipo, status, page, limit });
   }
 
-  /**
-   * Importação em massa (CSV/XLS/XLSX).
-   * Sem validação de tamanho/tipo no controller.
-   */
+  // ================== BUSCA POR ID ==================
+  @Get(':beneficiaryId')
+  async findOne(
+    @Param('clientId') clientId: string,
+    @Param('beneficiaryId') beneficiaryId: string,
+  ) {
+    const delegate = (this.svc as any).beneficiaryDelegate;
+    if (!delegate) {
+      throw new BadRequestException('Delegate Prisma para beneficiários não encontrado.');
+    }
+    return delegate.findFirstOrThrow({ where: { id: beneficiaryId, clientId } });
+  }
+
+  // ================== ATUALIZAÇÃO ==================
+  @Patch(':beneficiaryId')
+  async update(
+    @Param('clientId') clientId: string,
+    @Param('beneficiaryId') beneficiaryId: string,
+    @Body() dto: any,
+  ) {
+    const delegate = (this.svc as any).beneficiaryDelegate;
+    if (!delegate) {
+      throw new BadRequestException('Delegate Prisma para beneficiários não encontrado.');
+    }
+    return delegate.update({
+      where: { id: beneficiaryId },
+      data: { ...dto, clientId },
+    });
+  }
+
+  // ================== EXCLUSÃO ==================
+  @Delete(':beneficiaryId')
+  async remove(
+    @Param('clientId') clientId: string,
+    @Param('beneficiaryId') beneficiaryId: string,
+  ) {
+    return this.svc.remove(clientId, beneficiaryId);
+  }
+
+  // ================== EXCLUSÃO EM LOTE ==================
+  @Post('bulk-delete')
+  async bulkDelete(
+    @Param('clientId') clientId: string,
+    @Body() body: { ids?: string[] },
+  ) {
+    const ids = body?.ids ?? [];
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new BadRequestException('Envie { ids: string[] } com pelo menos 1 id.');
+    }
+    return this.svc.removeMany(clientId, ids);
+  }
+
+  // ================== UPLOAD DE BENEFICIÁRIOS ==================
   @Post('upload')
-  @HttpCode(200)
   @UseInterceptors(FileInterceptor('file'))
-  async uploadFile(
-    @Param('clientId', ParseCuidPipe) clientId: string,
+  async upload(
+    @Param('clientId') clientId: string,
     @UploadedFile() file: Express.Multer.File,
   ) {
-    return this.beneficiariesService.processUpload(clientId, file);
+    if (!file) throw new BadRequestException('Arquivo (form field "file") é obrigatório.');
+    return this.svc.upload(clientId, file);
   }
 
-  /** Cria um beneficiário (vida a vida). */
-  @Post()
-  @HttpCode(201)
-  create(
-    @Param('clientId', ParseCuidPipe) clientId: string,
-    @Body() createDto: CreateBeneficiaryDto,
-  ) {
-    return this.beneficiariesService.create(clientId, createDto);
+  // ================== CONSULTA DE IMPORTAÇÕES ==================
+  @Get('imports/latest')
+  async getLatestImport(@Param('clientId') clientId: string) {
+    return this.svc.getLatestImportRun(clientId);
   }
 
-  /** Exclusão em massa por IDs. */
-  @Post('bulk-delete')
-  @HttpCode(200)
-  removeMany(
-    @Param('clientId', ParseCuidPipe) clientId: string,
-    @Body() deleteManyDto: DeleteManyDto,
+  @Get('imports/run/:runId')
+  async getImportById(
+    @Param('clientId') clientId: string,
+    @Param('runId') runId: string,
   ) {
-    return this.beneficiariesService.removeMany(clientId, deleteManyDto);
+    return this.svc.getImportRun(clientId, runId);
   }
 
-  /** Detalhe de um beneficiário. */
-  @Get(':beneficiaryId')
-  findOne(
-    @Param('clientId', ParseCuidPipe) clientId: string,
-    @Param('beneficiaryId', ParseCuidPipe) beneficiaryId: string,
+  @Delete('imports/run/:runId')
+  async deleteImportById(
+    @Param('clientId') clientId: string,
+    @Param('runId') runId: string,
   ) {
-    return this.beneficiariesService.findOne(clientId, beneficiaryId);
+    return this.svc.deleteImportRun(clientId, runId);
   }
 
-  /** Atualiza parcialmente um beneficiário. */
-  @Patch(':beneficiaryId')
-  @HttpCode(200)
-  update(
-    @Param('clientId', ParseCuidPipe) clientId: string,
-    @Param('beneficiaryId', ParseCuidPipe) beneficiaryId: string,
-    @Body() updateDto: UpdateBeneficiaryDto,
-  ) {
-    return this.beneficiariesService.update(clientId, beneficiaryId, updateDto);
-  }
-
-  /** Exclui um beneficiário. */
-  @Delete(':beneficiaryId')
-  @HttpCode(200)
-  remove(
-    @Param('clientId', ParseCuidPipe) clientId: string,
-    @Param('beneficiaryId', ParseCuidPipe) beneficiaryId: string,
-  ) {
-    return this.beneficiariesService.remove(clientId, beneficiaryId);
+  @Delete('imports')
+  async clearAllImports(@Param('clientId') clientId: string) {
+    return this.svc.clearAllImportRuns(clientId);
   }
 }
