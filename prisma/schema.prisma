@@ -414,6 +414,10 @@ model Beneficiario {
 
   nomeCompleto     String
   cpf              String?            @db.VarChar(14)
+  /// Campo calculado no banco: lpad(regexp_replace(coalesce(cpf,''), '\D','','g'), 11, '0')
+  /// Prisma só lê/filtra; a coluna é gerada no DB.
+  cpfNormalized    String?            @map("cpf_normalized") @db.Text
+
   tipo             BeneficiarioTipo
   dataEntrada      DateTime
   dataSaida        DateTime?
@@ -448,6 +452,7 @@ model Beneficiario {
   updatedAt DateTime @updatedAt
 
   @@unique([clientId, cpf])
+  @@index([clientId, cpfNormalized])
   @@index([clientId, matricula])
   @@index([clientId, carteirinha])
   @@index([clientId, contrato])
@@ -457,7 +462,6 @@ model Beneficiario {
   @@map("health_beneficiaries")
 }
 
-// ===== Operadora/CSV: manter datas como STRING para aceitar "dd/mm/yyyy" sem parse ISO =====
 model BeneficiarioOperadora {
   id             String       @id @default(cuid())
   beneficiarioId String       @unique

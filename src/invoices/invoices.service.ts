@@ -29,6 +29,15 @@ export class InvoicesService {
       .replace(/[\s._-]+/g, '');
   }
 
+  private normName(s: any) {
+    return String(s ?? '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toUpperCase();
+  }
+
   /** Converte valores BR/US e parênteses negativos. */
   private toNumberSmart(raw: any): number {
     if (raw == null) return NaN;
@@ -80,6 +89,8 @@ export class InvoicesService {
       'unidade',
       'empresa',
       'cobrado',
+      'parentesco', // ajuda a achar header cedo
+      'tipo_usuario',
     ];
     let bestIdx = 0;
     let bestScore = -1;
@@ -157,12 +168,23 @@ export class InvoicesService {
     return false;
   }
 
+  private isTitularWord(s: any) {
+    const t = this.normName(s);
+    return t.startsWith('TITULAR');
+  }
+  private isDependentWord(s: any) {
+    const t = this.normName(s);
+    // cobre FILHO(A), CONJUGE, DEPENDENTE, ENTEADO, etc.
+    return !this.isTitularWord(t);
+  }
+
   /* ------------------------------- main ------------------------------------ */
 
   /**
    * Importa arquivo e grava em FaturaImportada (1 linha/beneficiário).
    * Filtra por credencial com regra estrita (allow/deny).
    * Deduplica por CPF priorizando a linha de valor 0.
+   * Corrige CPF de dependente "copiado" do titular usando o cadastro.
    */
   async processInvoiceUpload(
     clientId: string,
@@ -238,6 +260,15 @@ export class InvoicesService {
       'carteirinha',
     ].map((k) => this.normalizeKey(k));
 
+    // NOVO: precisamos saber se a linha é TITULAR/DEPENDENTE
+    const PARENTESCO_ALIASES = [
+      'parentesco',
+      'grau_parentesco',
+      'grauparentesco',
+      'tipo_usuario', // muitos layouts usam "Tipo_Usuario"
+      'tipo',
+    ].map((k) => this.normalizeKey(k));
+
     const pick = (obj: Record<string, any>, aliases: string[]) => {
       for (const a of aliases) {
         if (obj[a] !== undefined && obj[a] !== null && String(obj[a]).trim() !== '') {
@@ -254,6 +285,8 @@ export class InvoicesService {
       ...CPF_ALIASES,
       ...VALOR_ALIASES,
       ...CREDENCIAL_ALIASES,
+      ...PARENTESCO_ALIASES, // garante que teremos o "tipo" da linha
+      'empresa', // comum no header "empresa"
     ]);
 
     const normalizeNeeded = (obj: Record<string, any>) => {
@@ -317,6 +350,9 @@ export class InvoicesService {
           'credencial',
           'carteirinha',
           'cobrado',
+          'empresa',
+          'parentesco',
+          'tipo_usuario',
         ];
         let headerRow = range.s.r;
         let bestScore = -1;
@@ -378,6 +414,79 @@ export class InvoicesService {
 
     const dropped = Math.max(0, totalRows - kept.length);
 
+    /* ===== NOVO: corrigir CPF de dependente usando o cadastro =====
+       Regra: se a linha for de dependente e o CPF vier igual ao do titular anterior,
+       tento achar no cadastro (desse cliente) um dependente com MESMO NOME e cujo
+       TITULAR tenha este CPF. Se achar 1 único -> substituo o CPF da linha. */
+
+    // índice do cadastro
+    const bens = await this.prisma.beneficiario.findMany({
+      where: { clientId },
+      select: { id: true, nomeCompleto: true, cpf: true, tipo: true, titularId: true },
+    });
+    const idToCpf = new Map<string, string>();
+    for (const b of bens) if (b.id && b.cpf) idToCpf.set(b.id, b.cpf);
+
+    const depByTitularCpfAndName = new Map<string, Map<string, string>>(); // titularCpf -> (NOME -> cpfDep)
+    const byNameAll = new Map<string, { cpf: string; tipo: string }[]>();
+
+    for (const b of bens) {
+      if (b.nomeCompleto && b.cpf) {
+        const nk = this.normName(b.nomeCompleto);
+        const arr = byNameAll.get(nk) ?? [];
+        arr.push({ cpf: b.cpf, tipo: b.tipo });
+        byNameAll.set(nk, arr);
+      }
+      if (b.tipo !== 'TITULAR' && b.cpf && b.titularId) {
+        const tCpf = idToCpf.get(b.titularId);
+        if (tCpf) {
+          const n = this.normName(b.nomeCompleto ?? '');
+          if (n) {
+            const m = depByTitularCpfAndName.get(tCpf) ?? new Map<string, string>();
+            m.set(n, b.cpf);
+            depByTitularCpfAndName.set(tCpf, m);
+          }
+        }
+      }
+    }
+
+    let lastTitularCpf: string | null = null;
+
+    for (const rec of kept) {
+      const nome = pick(rec, NAME_ALIASES);
+      const parentesco = pick(rec, PARENTESCO_ALIASES);
+      const cpfDigits = this.cleanCPF(String(pick(rec, CPF_ALIASES) ?? ''));
+
+      if (this.isTitularWord(parentesco)) {
+        lastTitularCpf = cpfDigits || null;
+        continue;
+      }
+
+      // dependente:
+      if (!this.isDependentWord(parentesco)) continue; // sanity
+
+      // só tenta corrigir se veio igual ao do último titular
+      if (cpfDigits && lastTitularCpf && cpfDigits === lastTitularCpf && nome) {
+        const nk = this.normName(nome);
+        let fixedCpf: string | undefined;
+
+        // 1) preferencial: dependente cujo titular tem esse CPF
+        const mapByName = depByTitularCpfAndName.get(lastTitularCpf);
+        fixedCpf = mapByName?.get(nk);
+
+        // 2) fallback: nome único no cadastro (não titular)
+        if (!fixedCpf) {
+          const candidates = (byNameAll.get(nk) || []).filter((x) => x.tipo !== 'TITULAR');
+          if (candidates.length === 1) fixedCpf = candidates[0].cpf;
+        }
+
+        if (fixedCpf && fixedCpf !== lastTitularCpf) {
+          // marca override para o prepared usar
+          (rec as any)._cpfOverride = fixedCpf;
+        }
+      }
+    }
+
     // ====== PREPARO + DEDUP POR CPF ======
     type Prepared = {
       rec: Record<string, any>;
@@ -391,22 +500,18 @@ export class InvoicesService {
 
     const prepared: Prepared[] = kept
       .map((rec) => {
-        const nome = ((): any => {
-          for (const a of NAME_ALIASES) if (rec[a] != null && String(rec[a]).trim() !== '') return rec[a];
-          return undefined;
-        })();
-        const cpfRaw = ((): any => {
-          for (const a of CPF_ALIASES) if (rec[a] != null && String(rec[a]).trim() !== '') return rec[a];
-          return undefined;
-        })();
-        const valorRaw = ((): any => {
-          for (const a of VALOR_ALIASES) if (rec[a] != null && String(rec[a]).trim() !== '') return rec[a];
-          return undefined;
-        })();
+        const nome = pick(rec, NAME_ALIASES);
+
+        // usa override se existir
+        const cpfPicked = pick(rec, CPF_ALIASES);
+        const cpfFromOverride = (rec as any)._cpfOverride;
+        const cpfRaw = cpfFromOverride ?? cpfPicked;
 
         if (!cpfRaw) return null;
         const cpf = this.cleanCPF(String(cpfRaw));
         if (cpf.length !== 11) return null;
+
+        const valorRaw = pick(rec, VALOR_ALIASES);
 
         // vazio/NaN -> 0
         let parsed = 0;
@@ -474,8 +579,8 @@ export class InvoicesService {
             ...(insurerId ? { insurer: { connect: { id: insurerId } } } : {}),
             mesReferencia,
             nomeBeneficiarioOperadora: (p.nome ?? '').toString() || null,
-            cpfBeneficiarioOperadora: p.cpf,
-            valorCobradoOperadora: p.parsedValor, // deduplicado (duplicados = 0)
+            cpfBeneficiarioOperadora: p.cpf,             // <- já corrigido se houve override
+            valorCobradoOperadora: p.parsedValor,        // deduplicado (duplicados = 0)
             statusConciliacao: 'pendente',
             raw: p.rec,
           },
@@ -498,6 +603,7 @@ export class InvoicesService {
         cpf: detect(CPF_ALIASES),
         valor: detect(VALOR_ALIASES),
         credencial: detect(CREDENCIAL_ALIASES),
+        parentesco: detect(PARENTESCO_ALIASES),
       },
       dedup: {
         grupos: groups.size,

@@ -31,6 +31,19 @@ function parseCurrencyToNumber(v: unknown): number {
   return Number.isFinite(n) ? n : NaN;
 }
 
+const isYM = (s?: string) => !!s && /^\d{4}-\d{2}$/.test(s);
+function assertYM(label: string, s?: string) {
+  if (s && !isYM(s)) throw new BadRequestException(`Parâmetro "${label}" inválido. Use YYYY-MM.`);
+}
+
+/** Normaliza ALL/strings vazias e espaços */
+function buildFilters(params: { tipo?: TipoParam; plano?: string; centro?: string }) {
+  const tipo = !params.tipo || params.tipo === 'ALL' ? undefined : params.tipo;
+  const plano = params.plano?.trim() || undefined;
+  const centro = params.centro?.trim() || undefined;
+  return { tipo, plano, centro };
+}
+
 /** Aceita tanto {valorFaturaDeclarado, observacaoFechamento} quanto {totalFatura, observacoes}; inclui insurerId opcional */
 function normalizeCloseBody(
   body: any,
@@ -76,19 +89,13 @@ export class ReconciliationController {
     @Query('tipo') tipo?: TipoParam,
     @Query('plano') plano?: string,
     @Query('centro') centro?: string,
-    @Query('insurerId') insurerId?: string, // NOVO (opcional)
+    @Query('insurerId') insurerId?: string,
   ) {
-    if (mes && !/^\d{4}-\d{2}$/.test(mes)) {
-      throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
-    }
+    assertYM('mes', mes);
 
     return this.svc.buildReconciliation(clientId, {
       mesReferencia: mes,
-      filters: {
-        tipo: !tipo || tipo === 'ALL' ? undefined : tipo,
-        plano: plano?.trim() || undefined,
-        centro: centro?.trim() || undefined,
-      },
+      filters: buildFilters({ tipo, plano, centro }),
       insurerId: insurerId?.trim() || undefined,
     });
   }
@@ -116,11 +123,9 @@ export class ReconciliationController {
     @Query('tipo') tipo?: TipoParam,
     @Query('plano') plano?: string,
     @Query('centro') centro?: string,
-    @Query('insurerId') insurerId?: string, // NOVO (opcional)
+    @Query('insurerId') insurerId?: string,
   ): Promise<StreamableFile> {
-    if (mes && !/^\d{4}-\d{2}$/.test(mes)) {
-      throw new BadRequestException('Parâmetro "mes" inválido. Use YYYY-MM.');
-    }
+    assertYM('mes', mes);
     if (format === 'csv' && tab === 'all') {
       throw new BadRequestException('CSV não suporta "all". Selecione uma aba específica ou use XLSX.');
     }
@@ -129,11 +134,7 @@ export class ReconciliationController {
       mesReferencia: mes,
       format,
       tab,
-      filters: {
-        tipo: !tipo || tipo === 'ALL' ? undefined : tipo,
-        plano: plano?.trim() || undefined,
-        centro: centro?.trim() || undefined,
-      },
+      filters: buildFilters({ tipo, plano, centro }),
       insurerId: insurerId?.trim() || undefined,
     });
 
@@ -158,9 +159,13 @@ export class ReconciliationController {
   async reopen(
     @Param('clientId', ParseCuidPipe) clientId: string,
     @Body() dto: OpenReconciliationDTO, // { mes: 'YYYY-MM' }
-    @Query('insurerId') insurerId?: string, // NOVO (opcional via query para manter DTO existente)
+    @Query('insurerId') insurerId?: string, // opcional via query para manter DTO existente
   ) {
-    return this.svc.reopen(clientId, { mes: dto.mes, insurerId: insurerId?.trim() || undefined }, undefined);
+    return this.svc.reopen(
+      clientId,
+      { mes: dto.mes, insurerId: insurerId?.trim() || undefined },
+      undefined,
+    );
   }
 
   // ---- Histórico (consulta paginada) ----
@@ -173,12 +178,11 @@ export class ReconciliationController {
     @Query('page') pageStr?: string,
     @Query('limit') limitStr?: string,
     @Query('order') order: 'asc' | 'desc' = 'desc',
-    @Query('insurerId') insurerId?: string, // NOVO (opcional)
+    @Query('insurerId') insurerId?: string,
   ) {
-    const ymOk = (s?: string) => !s || /^\d{4}-\d{2}$/.test(s);
-    if (!ymOk(fromYM) || !ymOk(toYM)) {
-      throw new BadRequestException('from/to devem estar no formato YYYY-MM');
-    }
+    if (fromYM && !isYM(fromYM)) throw new BadRequestException('from deve estar no formato YYYY-MM');
+    if (toYM && !isYM(toYM)) throw new BadRequestException('to deve estar no formato YYYY-MM');
+
     const page = Math.max(1, Number(pageStr ?? 1) || 1);
     const limit = Math.min(200, Math.max(1, Number(limitStr ?? 24) || 24));
     const st = status && status !== 'ALL' ? status : undefined;
@@ -204,12 +208,11 @@ export class ReconciliationController {
     @Query('to') toYM?: string,
     @Query('status') status?: 'OPEN' | 'CLOSED' | 'ALL',
     @Query('format') format: 'xlsx' | 'csv' = 'xlsx',
-    @Query('insurerId') insurerId?: string, // NOVO (opcional)
+    @Query('insurerId') insurerId?: string,
   ): Promise<StreamableFile> {
-    const ymOk = (s?: string) => !s || /^\d{4}-\d{2}$/.test(s);
-    if (!ymOk(fromYM) || !ymOk(toYM)) {
-      throw new BadRequestException('from/to devem estar no formato YYYY-MM');
-    }
+    if (fromYM && !isYM(fromYM)) throw new BadRequestException('from deve estar no formato YYYY-MM');
+    if (toYM && !isYM(toYM)) throw new BadRequestException('to deve estar no formato YYYY-MM');
+
     const st = status && status !== 'ALL' ? status : undefined;
 
     const file = await this.svc.exportHistory(clientId, {

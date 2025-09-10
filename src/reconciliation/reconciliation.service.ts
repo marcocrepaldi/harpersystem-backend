@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma, RegimeCobranca } from '@prisma/client';
@@ -62,14 +63,10 @@ type FaturaRow = {
 
 // === regras de seguradora ===
 type PolicyJson = {
-  // arredondamento
   rounding?: { mode?: 'NEAREST'|'UP'|'DOWN'; precision?: number };
-  // pró-rata
   prorate?: { enabled?: boolean; basis?: 'CALENDAR_DAYS'|'30/360'; minDays?: number };
-  // limites
   minCharge?: number | null;
   maxCharge?: number | null;
-  // taxas
   fees?: Array<
     | { type: 'FIXED'; amount: number; when?: 'BEFORE_ROUND' | 'AFTER_ROUND' }
     | { type: 'PERCENT'; rate: number; base?: 'GROSS'|'AFTER_PRORATE_BEFORE_FEES'; when?: 'BEFORE_ROUND'|'AFTER_ROUND' }
@@ -80,7 +77,13 @@ type PolicyJson = {
 export class ReconciliationService {
   constructor(private readonly prisma: PrismaService) {}
 
-  // ---------- helpers ----------
+  // ---------- constantes de comparação ----------
+  /** comparação monetária em centavos (<= 1 centavo é OK) */
+  private readonly EPSILON_CENTS = 1;
+  /** “Grace period” (dias) para início do mês seguinte */
+  private readonly DEFAULT_GRACE_DAYS = 0;
+
+  // ---------- helpers de data ----------
   private ensureYYYYMM(mes?: string | Date): string {
     if (mes instanceof Date) {
       const y = mes.getUTCFullYear();
@@ -103,36 +106,81 @@ export class ReconciliationService {
   private nextMonthUTC(d: Date) {
     return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 0, 0, 0));
   }
+  private addDaysUTC(d: Date, days: number) {
+    return new Date(d.getTime() + days * 86400000);
+  }
 
-  private toNum(v: unknown): number {
+  // ---------- helpers monetários (centavos) ----------
+  /** Converte valores diversos (string “pt-BR”, “en-US”, número) para CENTAVOS inteiros */
+  private toCents(v: unknown): number {
     if (v == null) return 0;
-    if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+    if (typeof v === 'number') {
+      if (!Number.isFinite(v)) return 0;
+      return Math.round(v * 100);
+    }
     const original = String(v).trim();
     if (!original) return 0;
     const raw = original.replace(/[^\d.,\-]/g, '');
-    let n = 0;
+    let n: number;
     if (raw.includes(',')) n = Number(raw.replace(/\./g, '').replace(',', '.'));
     else if (raw.includes('.')) n = Number(raw);
     else {
       const asInt = Number(raw);
       n = Number.isInteger(asInt) && raw.length >= 3 ? asInt / 100 : asInt;
     }
-    return Number.isFinite(n) ? n : 0;
+    if (!Number.isFinite(n)) return 0;
+    return Math.round(n * 100);
   }
-  private toBRL(n: number) {
+
+  /** Converte centavos => string BRL */
+  private centsToBRL(cents: number) {
+    const n = (cents || 0) / 100;
     return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
   }
+
+  /** Função legacy (mantida para pontos que ainda usam número) */
+  private toNum(v: unknown): number {
+    return this.toCents(v) / 100;
+  }
+  private toBRL(n: number) {
+    return this.centsToBRL(Math.round(n * 100));
+  }
+
+  /** Normaliza CPF para 11 dígitos e ignora CPFs zerados */
+  private normalizeCpf(v?: string | null): string {
+    const digits = (v ?? '').replace(/\D/g, '');
+    if (!digits) return '';
+    const d =
+      digits.length === 11 ? digits : digits.length < 11 ? digits.padStart(11, '0') : digits.slice(0, 11);
+    if (/^0{11}$/.test(d)) return '';
+    return d;
+  }
+
   private maskCpf(cpf: string) {
-    const d = (cpf || '').replace(/\D/g, '').padStart(11, '•');
+    const d = this.normalizeCpf(cpf) || '•'.repeat(11);
     return `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9, 11)}`;
   }
 
-  private makeBenefWhereVigente(clientId: string, filters: Filters, start: Date, next: Date) {
+  /**
+   * Dias de "tolerância" para incluir beneficiários cuja data de entrada
+   * cai logo no começo do mês seguinte à competência da fatura (ex.: operadora antecipa cobrança).
+   * Pode futuramente vir de configuração por seguradora/cliente.
+   */
+  private getStartGraceDays(_insurerId?: string): number {
+    return this.DEFAULT_GRACE_DAYS;
+  }
+
+  private makeBenefWhereVigente(
+    clientId: string,
+    filters: Filters,
+    startInclusive: Date,
+    endExclusiveWithGrace: Date,
+  ) {
     const where: Prisma.BeneficiarioWhereInput = {
       clientId,
       status: 'ATIVO',
-      dataEntrada: { lt: next },
-      OR: [{ dataSaida: null }, { dataSaida: { gte: start } }],
+      dataEntrada: { lt: endExclusiveWithGrace }, // entrou antes do limite (1º do próximo mês + grace)
+      OR: [{ dataSaida: null }, { dataSaida: { gte: startInclusive } }], // não saiu ou saiu depois do início
     };
     if (filters?.tipo) (where as any).tipo = filters.tipo;
     if (filters?.plano) (where as any).plano = filters.plano;
@@ -142,7 +190,6 @@ export class ReconciliationService {
 
   // === regras de seguradora ===
   private async loadActiveRules(insurerId: string, clientId: string, start: Date, end: Date) {
-    // vigência que intersecta o mês
     return this.prisma.insurerBillingRule.findMany({
       where: {
         insurerId,
@@ -157,12 +204,10 @@ export class ReconciliationService {
     });
   }
 
-  private pickBestRule(rules: Array<any>, ctx: {
-    clientId: string;
-    planId?: string;
-    faixaEtaria?: string | null;
-    regime?: RegimeCobranca | null;
-  }) {
+  private pickBestRule(
+    rules: Array<any>,
+    ctx: { clientId: string; planId?: string; faixaEtaria?: string | null; regime?: RegimeCobranca | null },
+  ) {
     let best: any | undefined;
     let bestScore = -1;
     for (const r of rules) {
@@ -183,11 +228,13 @@ export class ReconciliationService {
     return Math.max(0, Math.round((end.getTime() - start.getTime()) / 86400000));
   }
 
-  private applyPolicy(base: number, ben: {
-    dataEntrada?: Date | null;
-    dataSaida?: Date | null;
-    regimeCobranca?: RegimeCobranca | null;
-  }, monthStart: Date, monthEnd: Date, policy: PolicyJson): number {
+  private applyPolicy(
+    base: number,
+    ben: { dataEntrada?: Date | null; dataSaida?: Date | null; regimeCobranca?: RegimeCobranca | null },
+    monthStart: Date,
+    monthEnd: Date,
+    policy: PolicyJson,
+  ): number {
     if (!Number.isFinite(base)) return 0;
 
     let amount = base;
@@ -196,9 +243,11 @@ export class ReconciliationService {
     const needProrate = policy?.prorate?.enabled || ben.regimeCobranca === 'DIARIO';
     if (needProrate) {
       const covStart = new Date(Math.max((ben.dataEntrada?.getTime() ?? -Infinity), monthStart.getTime()));
-      const covEnd   = new Date(Math.min(((ben.dataSaida ? new Date(ben.dataSaida.getTime()+86400000) : monthEnd).getTime()), monthEnd.getTime())); // end exclusivo
+      const covEnd = new Date(
+        Math.min(((ben.dataSaida ? new Date(ben.dataSaida.getTime() + 86400000) : monthEnd).getTime()), monthEnd.getTime()),
+      ); // end exclusivo
       const coveredDays = Math.max(0, this.daysBetween(covStart, covEnd));
-      const basis = policy?.prorate?.basis === '30/360' ? 30 : Math.max(28, this.daysBetween(monthStart, monthEnd)); // dias no mês
+      const basis = policy?.prorate?.basis === '30/360' ? 30 : this.daysBetween(monthStart, monthEnd);
       const minDays = policy?.prorate?.minDays ?? 0;
 
       const daily = base / (basis || 30);
@@ -206,8 +255,8 @@ export class ReconciliationService {
       amount = daily * chargeableDays;
     }
 
-    // fees BEFORE_ROUND (default)
-    for (const f of (policy?.fees ?? [])) {
+    // fees BEFORE_ROUND
+    for (const f of policy?.fees ?? []) {
       if ((f as any).when && (f as any).when !== 'BEFORE_ROUND') continue;
       if (f.type === 'FIXED') amount += f.amount;
       if (f.type === 'PERCENT') {
@@ -225,7 +274,7 @@ export class ReconciliationService {
     else amount = Math.round(amount * factor) / factor;
 
     // fees AFTER_ROUND
-    for (const f of (policy?.fees ?? [])) {
+    for (const f of policy?.fees ?? []) {
       if ((f as any).when === 'AFTER_ROUND') {
         if (f.type === 'FIXED') amount += f.amount;
         if (f.type === 'PERCENT') amount += amount * f.rate;
@@ -302,6 +351,9 @@ export class ReconciliationService {
     const anyFilter = !!(filters.tipo || filters.plano || filters.centro);
     const insurerId = opts?.insurerId ?? undefined;
 
+    // aplica "grace" para considerar entradas no comecinho do mês seguinte (ex.: 02/10)
+    const endBound = this.addDaysUTC(next, this.getStartGraceDays(insurerId));
+
     // 1) tenta itens (filtra por insurerId)
     let rows = await this.prisma.$queryRaw<FaturaRow[]>(Prisma.sql`
       SELECT i."id", i."nomeCompleto", i."cpf", i."valorPlano"
@@ -332,40 +384,83 @@ export class ReconciliationService {
       `);
     }
 
+    // normalização de fatura (mantém centavos para cálculos)
     const flatFatura = rows
       .map((r) => {
-        const cpf = (r.cpf ?? '').replace(/\D/g, '');
+        const cpf = this.normalizeCpf(r.cpf);
         if (!cpf) return null;
-        return { id: r.id, cpf, nome: r.nomeCompleto ?? '', valor: this.toNum(r.valorPlano) };
+        return {
+          id: r.id,
+          cpf,
+          nome: r.nomeCompleto ?? '',
+          valorCents: this.toCents(r.valorPlano),
+        };
       })
-      .filter(Boolean) as Array<{ id: string; cpf: string; nome: string; valor: number }>;
+      .filter(Boolean) as Array<{ id: string; cpf: string; nome: string; valorCents: number }>;
 
     const faturaCount = flatFatura.length;
-    const faturaSumNumber = flatFatura.reduce((acc, r) => acc + r.valor, 0);
+    const faturaSumCents = flatFatura.reduce((acc, r) => acc + r.valorCents, 0);
 
-    // Beneficiários vigentes
-    const ativos = await this.prisma.beneficiario.findMany({
-      where: this.makeBenefWhereVigente(clientId, filters, start, next),
+    // SET de CPFs da fatura
+    const faturaCpfsToMatch = Array.from(new Set(flatFatura.map((r) => r.cpf)));
+
+    // guard: se não tiver CPF, retorna payload vazio coerente (evita IN () inválido)
+    if (faturaCpfsToMatch.length === 0) {
+      return {
+        ok: true,
+        clientId,
+        mesReferencia: this.toYYYYMM01(ym),
+        totals: {
+          faturaCount: 0,
+          ativosCount: 0,
+          onlyInInvoice: 0,
+          onlyInRegistry: 0,
+          mismatched: 0,
+          duplicates: 0,
+          okCount: 0,
+          faturaSum: this.centsToBRL(0),
+          okSum: this.centsToBRL(0),
+          onlyInInvoiceSum: this.centsToBRL(0),
+        },
+        filtersApplied: filters,
+        tabs: { onlyInInvoice: [], onlyInRegistry: [], mismatched: [], duplicates: [], allInvoice: [] },
+        closure: undefined,
+      };
+    }
+
+    // Beneficiários vigentes via Prisma usando cpfNormalized (indexado)
+      const ativos = await this.prisma.beneficiario.findMany({
+        where: {
+          ...this.makeBenefWhereVigente(clientId, filters, start, endBound),
+          cpfNormalized: { in: Array.from(faturaCpfsToMatch) }
+        },
       select: {
-        id: true, nomeCompleto: true, cpf: true, valorMensalidade: true, plano: true,
-        faixaEtaria: true, regimeCobranca: true, dataEntrada: true, dataSaida: true,
+        id: true,
+        nomeCompleto: true,
+        cpf: true,
+        cpfNormalized: true,
+        valorMensalidade: true,
+        plano: true,
+        faixaEtaria: true,
+        regimeCobranca: true,
+        dataEntrada: true,
+        dataSaida: true,
       },
     });
 
-    // === regras de seguradora: carregar e preparar ===
+    // --- regras/ajustes ---
     const rules = insurerId ? await this.loadActiveRules(insurerId, clientId, start, next) : [];
     const planCache = new Map<string, string | null>();
 
-    const mapAtivos = new Map<string, { nome: string; mensalidade: number; adjusted: number }>();
+    // Mapa de ativos por CPF com mensalidade base e ajustada (centavos ao final)
+    const mapAtivos = new Map<string, { nome: string; mensalidadeCents: number; adjustedCents: number }>();
     for (const b of ativos) {
-      const cpf = (b.cpf ?? '').replace(/\D/g, '');
+      const cpf = b.cpfNormalized ?? this.normalizeCpf(b.cpf);
       if (!cpf) continue;
-      const baseMens = this.toNum(b.valorMensalidade as any);
 
-      // tenta identificar planId (se houver seguradora no contexto)
+      const baseMensNum = this.toNum(b.valorMensalidade as any);
+
       const planId = insurerId ? await this.resolvePlanIdByNameCached(planCache, insurerId, b.plano) : undefined;
-
-      // escolhe regra mais específica
       const rule = insurerId
         ? this.pickBestRule(rules, {
             clientId,
@@ -375,27 +470,30 @@ export class ReconciliationService {
           })
         : undefined;
 
-      const adjusted = rule
+      const adjustedNum = rule
         ? this.applyPolicy(
-            baseMens,
+            baseMensNum,
             { dataEntrada: b.dataEntrada, dataSaida: b.dataSaida, regimeCobranca: b.regimeCobranca ?? null },
             start,
             next,
-            (rule.policy as any) as PolicyJson
+            (rule.policy as any) as PolicyJson,
           )
-        : baseMens;
+        : baseMensNum;
 
-      mapAtivos.set(cpf, { nome: b.nomeCompleto ?? '', mensalidade: baseMens, adjusted });
+      mapAtivos.set(cpf, {
+        nome: b.nomeCompleto ?? '',
+        mensalidadeCents: Math.round(baseMensNum * 100),
+        adjustedCents: Math.round(adjustedNum * 100),
+      });
     }
-    const ativosSet = new Set(mapAtivos.keys());
 
-    // agrega a fatura por CPF
-    const byCpf = new Map<string, { nome: string; soma: number; valores: number[]; ids: string[] }>();
+    // agrega a fatura por CPF (centavos)
+    const byCpf = new Map<string, { nome: string; somaCents: number; valoresCents: number[]; ids: string[] }>();
     for (const r of flatFatura) {
-      const cur = byCpf.get(r.cpf) ?? { nome: r.nome, soma: 0, valores: [], ids: [] };
+      const cur = byCpf.get(r.cpf) ?? { nome: r.nome, somaCents: 0, valoresCents: [], ids: [] };
       cur.nome = cur.nome || r.nome;
-      cur.soma += r.valor;
-      cur.valores.push(r.valor);
+      cur.somaCents += r.valorCents;
+      cur.valoresCents.push(r.valorCents);
       cur.ids.push(r.id);
       byCpf.set(r.cpf, cur);
     }
@@ -408,83 +506,81 @@ export class ReconciliationService {
     const allInvoice: ReconTabs['allInvoice'] = [];
 
     // acumuladores
-    let onlyInInvoiceSumNum = 0;
-    let okSumNum = 0;
+    let onlyInInvoiceSumCents = 0;
+    let okSumCents = 0;
     let okCount = 0;
 
     // cruza fatura x cadastro
     for (const [cpf, info] of byCpf.entries()) {
-      const ativo = mapAtivos.get(cpf);
+      const beneficiarioMatched = mapAtivos.get(cpf);
 
-      if (!ativo) {
+      if (!beneficiarioMatched) {
         if (!anyFilter) {
           onlyInInvoice.push({
             id: info.ids[0] ?? `INV:${cpf}`,
             cpf: this.maskCpf(cpf),
             nome: info.nome || '—',
-            valorCobrado: this.toBRL(info.soma),
+            valorCobrado: this.centsToBRL(info.somaCents),
           });
-          onlyInInvoiceSumNum += info.soma;
+          onlyInInvoiceSumCents += info.somaCents;
         }
         continue;
       }
 
-      if (info.valores.length > 1) {
+      if (info.valoresCents.length > 1) {
         duplicates.push({
           id: info.ids[0] ?? `DUP:${cpf}`,
           cpf: this.maskCpf(cpf),
-          nome: ativo.nome || info.nome || '—',
-          ocorrencias: info.valores.length,
-          somaCobrada: this.toBRL(info.soma),
-          valores: info.valores.map((v) => this.toBRL(v)),
+          nome: beneficiarioMatched.nome || info.nome || '—',
+          ocorrencias: info.valoresCents.length,
+          somaCobrada: this.centsToBRL(info.somaCents),
+          valores: info.valoresCents.map((v) => this.centsToBRL(v)),
         });
       }
 
-      // compara com valor AJUSTADO pela regra (se houver)
-      const esperado = insurerId ? ativo.adjusted : ativo.mensalidade;
+      const esperadoCents = insurerId ? beneficiarioMatched.adjustedCents : beneficiarioMatched.mensalidadeCents;
+      const diffAbsCents = Math.abs(info.somaCents - esperadoCents);
 
-      const diffAbs = Math.abs(info.soma - esperado);
-      if (diffAbs > 0.009) {
+      if (diffAbsCents > this.EPSILON_CENTS) {
         mismatched.push({
           id: info.ids[0] ?? `MIS:${cpf}`,
           cpf: this.maskCpf(cpf),
-          nome: ativo.nome || info.nome || '—',
-          valorCobrado: this.toBRL(info.soma),
-          valorMensalidade: this.toBRL(esperado),
-          diferenca: this.toBRL(info.soma - esperado),
+          nome: beneficiarioMatched.nome || info.nome || '—',
+          valorCobrado: this.centsToBRL(info.somaCents),
+          valorMensalidade: this.centsToBRL(esperadoCents),
+          diferenca: this.centsToBRL(info.somaCents - esperadoCents),
         });
       } else {
-        okSumNum += info.soma;
+        okSumCents += info.somaCents;
         okCount += 1;
       }
     }
 
-    // Só no cadastro
+    // Só no cadastro (vigente) — mas não veio na fatura
     for (const [cpf, ativo] of mapAtivos.entries()) {
       if (!byCpf.has(cpf)) {
-        const esperado = insurerId ? ativo.adjusted : ativo.mensalidade;
+        const esperadoCents = insurerId ? ativo.adjustedCents : ativo.mensalidadeCents;
         onlyInRegistry.push({
           id: `REG:${cpf}`,
           cpf: this.maskCpf(cpf),
           nome: ativo.nome || '—',
-          valorMensalidade: this.toBRL(esperado),
+          valorMensalidade: this.centsToBRL(esperadoCents),
         });
       }
     }
 
     // Monta a visão "Fatura (todos)"
     for (const r of flatFatura) {
-      if (anyFilter && !ativosSet.has(r.cpf)) continue;
       const ativo = mapAtivos.get(r.cpf);
-      const mensal = ativo ? (insurerId ? ativo.adjusted : ativo.mensalidade) : NaN;
-      const diff = ativo ? r.valor - mensal : NaN;
+      const mensalCents = ativo ? (insurerId ? ativo.adjustedCents : ativo.mensalidadeCents) : NaN;
+      const diffCents = ativo ? r.valorCents - (mensalCents as number) : NaN;
 
       const status: 'OK' | 'DIVERGENTE' | 'DUPLICADO' | 'SOFATURA' =
         !ativo
           ? 'SOFATURA'
-          : (byCpf.get(r.cpf)?.valores.length ?? 0) > 1
+          : (byCpf.get(r.cpf)?.valoresCents.length ?? 0) > 1
           ? 'DUPLICADO'
-          : Math.abs(diff) > 0.009
+          : Math.abs(diffCents as number) > this.EPSILON_CENTS
           ? 'DIVERGENTE'
           : 'OK';
 
@@ -492,9 +588,9 @@ export class ReconciliationService {
         id: r.id,
         cpf: this.maskCpf(r.cpf),
         nome: (ativo?.nome || r.nome || '—') as string,
-        valorCobrado: this.toBRL(r.valor),
-        valorMensalidade: ativo ? this.toBRL(mensal) : '—',
-        diferenca: ativo ? this.toBRL(diff) : '—',
+        valorCobrado: this.centsToBRL(r.valorCents),
+        valorMensalidade: ativo ? this.centsToBRL(mensalCents as number) : '—',
+        diferenca: ativo ? this.centsToBRL(diffCents as number) : '—',
         status,
       });
     }
@@ -526,13 +622,9 @@ export class ReconciliationService {
       existingClosure
         ? {
             status: existingClosure.status === 'FECHADA' ? 'CLOSED' : 'OPEN',
-            totalFatura:
-              typeof declaredTotal === 'number' ? this.toBRL(declaredTotal) : undefined,
+            totalFatura: typeof declaredTotal === 'number' ? this.centsToBRL(Math.round(declaredTotal * 100)) : undefined,
             closedAt: existingClosure.closedAt?.toISOString(),
-            notes:
-              typeof (existingClosure.totals as any)?.notes === 'string'
-                ? (existingClosure.totals as any).notes
-                : null,
+            notes: typeof (existingClosure.totals as any)?.notes === 'string' ? (existingClosure.totals as any).notes : null,
           }
         : undefined;
 
@@ -548,9 +640,9 @@ export class ReconciliationService {
         mismatched: mismatched.length,
         duplicates: duplicates.length,
         okCount,
-        faturaSum: this.toBRL(faturaSumNumber),
-        okSum: this.toBRL(okSumNum),
-        onlyInInvoiceSum: this.toBRL(onlyInInvoiceSumNum),
+        faturaSum: this.centsToBRL(faturaSumCents),
+        okSum: this.centsToBRL(okSumCents),
+        onlyInInvoiceSum: this.centsToBRL(onlyInInvoiceSumCents),
       },
       filtersApplied: filters,
       tabs: { onlyInInvoice, onlyInRegistry, mismatched, duplicates, allInvoice },
@@ -697,8 +789,6 @@ export class ReconciliationService {
       okCount: payload.totals.okCount,
     };
 
-    // como a unique é (clientId, mesReferencia, insurerId) e insurerId pode ser NULL,
-    // evitamos upsert com where composto: usamos findFirst -> create/update
     const existing = await this.prisma.conciliacao.findFirst({
       where: {
         clientId,
@@ -744,11 +834,7 @@ export class ReconciliationService {
   }
 
   // ---------- Reabrir mês ----------
-  async reopen(
-    clientId: string,
-    dto: { mes: string; insurerId?: string },
-    _actorId?: string,
-  ) {
+  async reopen(clientId: string, dto: { mes: string; insurerId?: string }, _actorId?: string) {
     const ym = this.ensureYYYYMM(dto.mes);
     const mesReferencia = this.firstDayUTC(ym);
     const insurerId = dto.insurerId ?? undefined;
@@ -777,7 +863,7 @@ export class ReconciliationService {
     clientId: string,
     opts?: {
       fromYM?: string; // inclusive
-      toYM?: string;   // inclusive
+      toYM?: string; // inclusive
       page?: number;
       limit?: number;
       status?: 'OPEN' | 'CLOSED';
@@ -825,9 +911,7 @@ export class ReconciliationService {
     const where: Prisma.ConciliacaoWhereInput = {
       clientId,
       ...(opts?.insurerId ? { insurerId: opts.insurerId } : {}),
-      ...(opts?.insurerId === undefined ? {} : {}), // apenas para clareza
     };
-    // período
     if (opts?.fromYM || opts?.toYM) {
       const gte = opts?.fromYM ? this.firstDayUTC(opts.fromYM) : undefined;
       const lte = opts?.toYM ? this.nextMonthUTC(this.firstDayUTC(opts.toYM)) : undefined;
@@ -836,7 +920,6 @@ export class ReconciliationService {
         ...(lte ? { lt: lte } : {}),
       };
     }
-    // status
     if (opts?.status) {
       where.status = opts.status === 'CLOSED' ? 'FECHADA' : 'ABERTA';
     }
@@ -859,49 +942,46 @@ export class ReconciliationService {
       }),
     ]);
 
-    // nomes de quem fechou (se houver)
-    const closers = Array.from(new Set(rowsRaw.map(r => r.closedBy).filter(Boolean))) as string[];
+    const closers = Array.from(new Set(rowsRaw.map((r) => r.closedBy).filter(Boolean))) as string[];
     const usersById = closers.length
-      ? (await this.prisma.user.findMany({
-          where: { id: { in: closers } },
-          select: { id: true, name: true, email: true },
-        })).reduce<Record<string, { id: string; name?: string | null; email?: string | null }>>(
+      ? (
+          await this.prisma.user.findMany({
+            where: { id: { in: closers } },
+            select: { id: true, name: true, email: true },
+          })
+        ).reduce<Record<string, { id: string; name?: string | null; email?: string | null }>>(
           (acc, u) => ((acc[u.id] = { id: u.id, name: u.name, email: u.email }), acc),
           {},
         )
       : {};
 
-    let sumDeclarado = 0;
-    let sumFatura = 0;
+    let sumDeclaradoCents = 0;
+    let sumFaturaCents = 0;
     let closedCount = 0;
     let openCount = 0;
 
     const rows = rowsRaw.map((r) => {
-      const ym = `${r.mesReferencia.getUTCFullYear()}-${String(
-        r.mesReferencia.getUTCMonth() + 1,
-      ).padStart(2, '0')}`;
+      const ym = `${r.mesReferencia.getUTCFullYear()}-${String(r.mesReferencia.getUTCMonth() + 1).padStart(2, '0')}`;
 
       const t = (r.totals ?? {}) as any;
       const c = (r.counts ?? {}) as any;
 
-      const declaradoNum =
-        typeof t.declaredTotal === 'number' ? t.declaredTotal : this.toNum(t.declaredTotal);
-      const faturaNum = this.toNum(t.faturaSum);
+      // Totais podem ter sido salvos como número ou string formatada — converto com robustez:
+      const declaradoCents =
+        typeof t.declaredTotal === 'number' ? Math.round(t.declaredTotal * 100) : this.toCents(t.declaredTotal);
+      const faturaCents =
+        typeof t.faturaSum === 'string' ? this.toCents(t.faturaSum) : Math.round((t.faturaSum ?? 0) * 100);
 
-      if (Number.isFinite(declaradoNum)) sumDeclarado += declaradoNum;
-      if (Number.isFinite(faturaNum)) sumFatura += faturaNum;
+      if (Number.isFinite(declaradoCents)) sumDeclaradoCents += declaradoCents;
+      if (Number.isFinite(faturaCents)) sumFaturaCents += faturaCents;
 
       if (r.status === 'FECHADA') closedCount += 1;
       else openCount += 1;
 
-      // <- aqui garantimos literal type
       const status: 'OPEN' | 'CLOSED' = r.status === 'FECHADA' ? 'CLOSED' : 'OPEN';
 
-      // força strings nos totais (ou undefined)
-      const declaradoStr = Number.isFinite(declaradoNum) ? this.toBRL(declaradoNum) : undefined;
-      const faturaStr = typeof t.faturaSum === 'string'
-        ? t.faturaSum
-        : (Number.isFinite(faturaNum) ? this.toBRL(faturaNum) : undefined);
+      const declaradoStr = Number.isFinite(declaradoCents) ? this.centsToBRL(declaradoCents) : undefined;
+      const faturaStr = Number.isFinite(faturaCents) ? this.centsToBRL(faturaCents) : undefined;
       const okStr = typeof t.okSum === 'string' ? t.okSum : undefined;
       const onlyInvoiceStr = typeof t.onlyInInvoiceSum === 'string' ? t.onlyInInvoiceSum : undefined;
 
@@ -935,9 +1015,9 @@ export class ReconciliationService {
       pagination: { page, limit, total, hasMore: skip + rows.length < total },
       rows,
       summary: {
-        totalDeclarado: this.toBRL(sumDeclarado),
-        totalFatura: this.toBRL(sumFatura),
-        diferenca: this.toBRL(sumDeclarado - sumFatura),
+        totalDeclarado: this.centsToBRL(sumDeclaradoCents),
+        totalFatura: this.centsToBRL(sumFaturaCents),
+        diferenca: this.centsToBRL(sumDeclaradoCents - sumFaturaCents),
         closedCount,
         openCount,
       },
@@ -947,13 +1027,7 @@ export class ReconciliationService {
   // ---------- Exportar histórico ----------
   async exportHistory(
     clientId: string,
-    opts: {
-      fromYM?: string;
-      toYM?: string;
-      status?: 'OPEN' | 'CLOSED';
-      format: 'xlsx' | 'csv';
-      insurerId?: string;
-    },
+    opts: { fromYM?: string; toYM?: string; status?: 'OPEN' | 'CLOSED'; format: 'xlsx' | 'csv'; insurerId?: string },
   ): Promise<{ filename: string; contentType: string; buffer: Buffer }> {
     const all = await this.listHistory(clientId, {
       fromYM: opts.fromYM,
@@ -972,7 +1046,7 @@ export class ReconciliationService {
       Fatura: r.totals.fatura ?? '',
       Diferenca:
         r.totals.declarado && r.totals.fatura
-          ? this.toBRL(this.toNum(r.totals.declarado) - this.toNum(r.totals.fatura))
+          ? this.centsToBRL(this.toCents(r.totals.declarado) - this.toCents(r.totals.fatura))
           : '',
       ItensImportados: r.counts.faturaCount,
       BenefAtivos: r.counts.ativosCount,

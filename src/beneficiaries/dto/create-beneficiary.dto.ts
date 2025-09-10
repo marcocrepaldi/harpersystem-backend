@@ -17,6 +17,7 @@ import {
   MotivoMovimento,
   BeneficiarioTipo,
 } from '@prisma/client';
+import { PartialType } from '@nestjs/mapped-types';
 
 /* ================= Helpers ================= */
 const trim = (v: unknown) => (typeof v === 'string' ? v.trim() : v);
@@ -37,15 +38,21 @@ export enum SexoDto { M = 'M', F = 'F' }
 @ValidatorConstraint({ name: 'TitularVinculoConsistency', async: false })
 export class TitularVinculoConsistency implements ValidatorConstraintInterface {
   validate(value: unknown, args: ValidationArguments): boolean {
-    const o = args.object as CreateBeneficiaryDto;
+    // funciona para Create e Update (se tipo não veio, não bloqueia)
+    const o: any = args.object;
     const tipo = String(o?.tipo ?? '').toUpperCase();
+
+    if (!tipo) return true; // no update pode não enviar tipo → não valida vínculo
+
     if (tipo === 'TITULAR') {
+      // titular não deve ter titularId
       return value === undefined || value === null || String(value).trim() === '';
     }
+    // dependentes (FILHO/CONJUGE) precisam de titularId presente
     return typeof value === 'string' && value.trim().length > 0;
   }
   defaultMessage(args: ValidationArguments): string {
-    const o = args.object as CreateBeneficiaryDto;
+    const o: any = args.object;
     const tipo = String(o?.tipo ?? '').toUpperCase();
     return tipo === 'TITULAR'
       ? 'titularId não deve ser informado quando tipo = TITULAR.'
@@ -57,7 +64,7 @@ export class TitularVinculoConsistency implements ValidatorConstraintInterface {
 @ValidatorConstraint({ name: 'DatesConsistency', async: false })
 export class DatesConsistency implements ValidatorConstraintInterface {
   validate(_value: unknown, args: ValidationArguments): boolean {
-    const o = args.object as CreateBeneficiaryDto;
+    const o: any = args.object;
     if (!o?.dataEntrada || !o?.dataSaida) return true;
     const dIn = new Date(o.dataEntrada);
     const dOut = new Date(o.dataSaida);
@@ -73,8 +80,9 @@ export class DatesConsistency implements ValidatorConstraintInterface {
 @ValidatorConstraint({ name: 'ExitImpliesInactive', async: false })
 export class ExitImpliesInactive implements ValidatorConstraintInterface {
   validate(_value: unknown, args: ValidationArguments): boolean {
-    const o = args.object as CreateBeneficiaryDto;
+    const o: any = args.object;
     if (!o?.dataSaida) return true;
+    // se informou dataSaida, status não pode ser ATIVO (ou seja, deve ser INATIVO)
     return o.status !== BeneficiarioStatus.ATIVO;
   }
   defaultMessage(): string {
@@ -82,7 +90,7 @@ export class ExitImpliesInactive implements ValidatorConstraintInterface {
   }
 }
 
-/* ===================== DTO ===================== */
+/* ===================== DTO (CREATE) ===================== */
 export class CreateBeneficiaryDto {
   @IsString()
   @IsNotEmpty({ message: 'O nome completo é obrigatório.' })
@@ -102,7 +110,7 @@ export class CreateBeneficiaryDto {
    * Aceita "TITULAR", "FILHO", "CONJUGE" e o legado "DEPENDENTE" (mapeado para FILHO).
    */
   @Transform(({ value }) => {
-    if (!value) return value;
+    if (value == null || value === '') return value;
     const v = toEnumInput(value);
     if (v === 'DEPENDENTE') return BeneficiarioTipo.FILHO;
     if (v === 'TITULAR') return BeneficiarioTipo.TITULAR;
@@ -170,15 +178,14 @@ export class CreateBeneficiaryDto {
   @IsOptional() @IsString() @Transform(({ value }) => emptyToUndefined(trim(value))) comentario?: string;
 
   @Transform(({ value, obj }) => {
-    const v = value;
     const hasExit = !!obj?.dataSaida;
-    if (v == null || v === '') {
+    if (value == null || value === '') {
       return hasExit ? BeneficiarioStatus.INATIVO : undefined;
     }
-    const t = toEnumInput(v);
+    const t = toEnumInput(value);
     if (t === 'ATIVO') return BeneficiarioStatus.ATIVO;
     if (t === 'INATIVO') return BeneficiarioStatus.INATIVO;
-    return v;
+    return value;
   })
   @IsOptional()
   @IsEnum(BeneficiarioStatus, { message: 'status deve ser ATIVO ou INATIVO.' })
@@ -217,4 +224,35 @@ export class CreateBeneficiaryDto {
   motivoMovimento?: MotivoMovimento;
 
   @IsOptional() @IsString() @Transform(({ value }) => emptyToUndefined(trim(value))) observacoes?: string;
+}
+
+/* ===================== DTO (UPDATE) ===================== */
+/**
+ * No update:
+ * - tudo é opcional;
+ * - mantemos os mesmos transforms (inclusive "DEPENDENTE" → FILHO);
+ * - relaxamos a obrigatoriedade de dataEntrada;
+ * - validadores: vínculo com titular só roda se "tipo" vier no payload.
+ */
+export class UpdateBeneficiaryDto extends PartialType(CreateBeneficiaryDto) {
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (value == null || value === '') return value;
+    const v = toEnumInput(value);
+    if (v === 'DEPENDENTE') return BeneficiarioTipo.FILHO;
+    if (v === 'TITULAR') return BeneficiarioTipo.TITULAR;
+    if (v === 'FILHO') return BeneficiarioTipo.FILHO;
+    if (v === 'CONJUGE' || v === 'CONJUGUE' || v === 'CÔNJUGE') return BeneficiarioTipo.CONJUGE;
+    return value;
+  })
+  @IsEnum(BeneficiarioTipo, { message: 'tipo deve ser TITULAR, FILHO ou CONJUGE.' })
+  override tipo?: BeneficiarioTipo;
+
+  @IsOptional()
+  @IsDateString({}, { message: 'dataEntrada deve ser uma data ISO (YYYY-MM-DD).' })
+  override dataEntrada?: string;
+
+  @IsOptional()
+  @Validate(TitularVinculoConsistency)
+  override titularId?: string;
 }

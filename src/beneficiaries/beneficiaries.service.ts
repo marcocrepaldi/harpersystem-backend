@@ -11,15 +11,13 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { randomUUID } from 'node:crypto';
 
-/**
- * Implementa listagem e upload com parsing do CSV real,
- * grava Beneficiario + relação 1:1 "operadora", e cria ImportRun.
- *
- * Extensões:
- * - resolvePlanForClient: resolve plano por HealthPlan.slug ou PlanAlias.alias (normalizado)
- * - pickClientPlanPrice: pega preço vigente (ou fallback mais recente) em ClientHealthPlanPrice
- * - Integra upload: define coreData.valorMensalidade a partir do preço do plano e loga em updatedDetails
- */
+import {
+  normalizeCpf as padCpfTo11,
+  isValidCpf,
+  onlyDigits as digitsOnly,
+  normalizeCpfFromLayout,
+  CpfStatus,
+} from '../common/cpf';
 
 /* ===================== Helpers ===================== */
 
@@ -37,13 +35,11 @@ const normLower = (s: any) =>
     .trim()
     .toLowerCase();
 
-const digitsOnly = (v: any) => String(v ?? '').replace(/\D/g, '');
-
-const toSexo = (v: any): 'M' | 'F' | undefined => {
-  const s = norm(v);
-  if (s.startsWith('M')) return 'M';
-  if (s.startsWith('F')) return 'F';
-  return undefined;
+const maskCpf = (raw?: string | null) => {
+  if (!raw) return null;
+  const s = String(raw).replace(/\D/g, '').padStart(11, '0').slice(-11);
+  if (s.length !== 11) return raw;
+  return s.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4');
 };
 
 const EXCEL_EPOCH = new Date(Date.UTC(1899, 11, 30));
@@ -53,7 +49,6 @@ function fromExcelSerial(n: number): Date {
   return d;
 }
 
-/** Retorna Date (para campos do core) */
 function parseDateFlexible(raw: any): Date | null {
   if (raw == null) return null;
 
@@ -68,10 +63,11 @@ function parseDateFlexible(raw: any): Date | null {
   const iso = new Date(s);
   if (!isNaN(iso.getTime())) return iso;
 
-  const m1 = s.match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{4})$/);
+  const m1 = s.match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{2,4})$/);
   if (m1) {
-    const [, dd, mm, yyyy] = m1;
-    const d = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
+    let [, dd, mm, yy] = m1;
+    if (yy.length === 2) yy = String(2000 + Number(yy));
+    const d = new Date(Date.UTC(Number(yy), Number(mm) - 1, Number(dd)));
     return isNaN(d.getTime()) ? null : d;
   }
 
@@ -85,7 +81,6 @@ function parseDateFlexible(raw: any): Date | null {
   return null;
 }
 
-/** Converte input arbitrário em ISO string ou null (para os campos da tabela operadora que são string no Prisma). */
 function toIsoStringOrNull(raw: any): string | null {
   const d = parseDateFlexible(raw);
   return d ? d.toISOString() : null;
@@ -98,7 +93,8 @@ function normalizeTipoFromCsv(
   const t = norm(tipoUsuario);
   if (t.startsWith('TITULAR')) return BeneficiarioTipo.TITULAR;
   const g = norm(grauParentesco);
-  if (g.startsWith('CONJUGE') || g.startsWith('CONJUGUE')) return BeneficiarioTipo.CONJUGE;
+  if (g.startsWith('CONJUGE') || g.startsWith('CONJUGUE'))
+    return BeneficiarioTipo.CONJUGE;
   return BeneficiarioTipo.FILHO;
 }
 
@@ -107,11 +103,12 @@ function statusFromCsv(dtCancelamento: any): BeneficiarioStatus {
   return has ? BeneficiarioStatus.INATIVO : BeneficiarioStatus.ATIVO;
 }
 
-function entradaFromCsv(dtAdmissao: any, dtCadastro: any): Date {
-  const a = parseDateFlexible(dtAdmissao);
-  if (a) return a;
+/** NOVA REGRA: Data_Cadastro é o início da vigência; se vazio, usa Dt_Admissao */
+function entradaFromCsv(dtCadastro: any, dtAdmissao: any): Date {
   const c = parseDateFlexible(dtCadastro);
   if (c) return c;
+  const a = parseDateFlexible(dtAdmissao);
+  if (a) return a;
   return new Date();
 }
 
@@ -120,11 +117,14 @@ function saidaFromCsv(dtCancelamento: any): Date | undefined {
   return d ?? undefined;
 }
 
+/** Parser simples CSV (usado porque o layout já vem limpo do front) */
 function parseCsvBuffer(buf: Buffer): Array<Record<string, string>> {
   const text = buf.toString('utf8');
-  const firstLine = text.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
+  const firstLine =
+    text.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
   const sep =
-    (firstLine.match(/;/g)?.length ?? 0) > (firstLine.match(/,/g)?.length ?? 0)
+    (firstLine.match(/;/g)?.length ?? 0) >
+    (firstLine.match(/,/g)?.length ?? 0)
       ? ';'
       : ',';
 
@@ -143,9 +143,22 @@ function parseCsvBuffer(buf: Buffer): Array<Record<string, string>> {
   return rows;
 }
 
-function normalizeCpf(v: any): string {
-  const d = digitsOnly(v);
-  return d.length === 11 ? d : '';
+/* ---------- chaves de “família” para ligar titular/dependentes ---------- */
+function baseFromCodigoUsuario(code: any): string | null {
+  const s = String(code ?? '');
+  // pega 9 dígitos finais (xxxxxxYYY) e usa os 6 primeiros como base
+  const m = s.match(/(\d{6})\d{3}$/);
+  return m ? m[1] : null;
+}
+function familyKey(row: Record<string, any>): string {
+  const base = baseFromCodigoUsuario(row['Codigo_Usuario']);
+  if (base) return `C:${base}`;
+  // fallback por combinação mais estável
+  const emp = String(row['Empresa'] ?? '').trim();
+  const mat = String(row['Matricula'] ?? '').trim();
+  const pla = String(row['Plano'] ?? '').trim();
+  const fil = String(row['Filial'] ?? '').trim();
+  return `M:${emp}|${mat}|${pla}|${fil}`;
 }
 
 /* ===================== Tipos do payload ===================== */
@@ -159,7 +172,7 @@ type UpdatedDetail = {
   cpf?: string | null;
   nome?: string | null;
   tipo?: string | null;
-  matchBy: 'CPF' | 'NOME_DTNASC';
+  matchBy: 'CPF' | 'NOME_DTNASC' | 'CPF_LEGACY';
   changed: Diff[];
 };
 
@@ -200,26 +213,22 @@ export class BeneficiariesService {
     return (this.prisma as unknown as PrismaClient).beneficiario;
   }
 
-  /* --------- Resolução de plano e preço --------- */
-
-  /** Resolve planId a partir do valor da coluna Plano do CSV, usando PlanAlias.alias (normalizado) ou HealthPlan.slug/name. */
+  /** Resolve planId a partir do valor da coluna Plano do CSV */
   private async resolvePlanForClient(
     _clientId: string,
     planoDoCsv: any,
   ): Promise<{ planId: string } | null> {
     const original = String(planoDoCsv ?? '').trim();
     const lower = original.toLowerCase();
-    const normKey = normLower(original);
-    if (!normKey) return null;
+    const key = normLower(original);
+    if (!key) return null;
 
-    // 1) Bate por alias normalizado
     const alias = await this.prisma.planAlias.findFirst({
-      where: { alias: normKey },
+      where: { alias: key },
       select: { planId: true },
     });
     if (alias) return { planId: alias.planId };
 
-    // 2) Tenta por slug/name de forma tolerante
     const candidates = await this.prisma.healthPlan.findMany({
       where: {
         OR: [
@@ -236,7 +245,7 @@ export class BeneficiariesService {
 
     if (candidates.length) {
       const exact = candidates.find(
-        (p) => normLower(p.slug) === normKey || normLower(p.name) === normKey,
+        (p) => normLower(p.slug) === key || normLower(p.name) === key,
       );
       return { planId: (exact ?? candidates[0]).id };
     }
@@ -244,7 +253,6 @@ export class BeneficiariesService {
     return null;
   }
 
-  /** Busca o preço vigente hoje; se não houver, usa o mais recente por vigenciaInicio. Tenta com faixaEtaria e depois sem. */
   private async pickClientPlanPrice(
     clientId: string,
     planId: string,
@@ -288,7 +296,6 @@ export class BeneficiariesService {
 
     const withBand = await fetch(true);
     if (withBand) return withBand;
-
     return await fetch(false);
   }
 
@@ -296,7 +303,13 @@ export class BeneficiariesService {
 
   async list(
     clientId: string,
-    opts: { search?: string; tipo?: string; status?: string; page?: number; limit?: number },
+    opts: {
+      search?: string;
+      tipo?: string;
+      status?: string;
+      page?: number;
+      limit?: number;
+    },
   ): Promise<PageResult<any>> {
     const page = Math.max(1, Number(opts.page ?? 1));
     const limit = Math.max(1, Math.min(5000, Number(opts.limit ?? 1000)));
@@ -331,10 +344,36 @@ export class BeneficiariesService {
 
     const items = rows.map((b) => {
       const o = b.operadora;
+
+      let cpfStatus: CpfStatus = 'missing';
+      let cpfMessage = 'CPF ausente no layout.';
+      const rawLayout =
+        b.tipo === BeneficiarioTipo.TITULAR ? o?.cpfOperadora : o?.cpfDependente;
+      const rawDigits = rawLayout ? digitsOnly(rawLayout) : '';
+
+      if (b.cpf && isValidCpf(b.cpf)) {
+        if (rawDigits && rawDigits.length < 11 && padCpfTo11(rawDigits) === b.cpf) {
+          cpfStatus = 'adjusted';
+          cpfMessage =
+            'CPF ajustado com zeros à esquerda a partir do layout.';
+        } else {
+          cpfStatus = 'valid';
+          cpfMessage = 'CPF válido.';
+        }
+      } else {
+        const info = normalizeCpfFromLayout(rawDigits);
+        cpfStatus = info.status;
+        cpfMessage = info.message ?? cpfMessage;
+      }
+
       return {
         id: b.id,
         nomeCompleto: b.nomeCompleto,
-        cpf: b.cpf,
+        cpf: maskCpf(b.cpf),
+
+        cpfStatus,
+        cpfMessage,
+
         tipo: b.tipo,
         dataEntrada: b.dataEntrada,
         dataNascimento: b.dataNascimento,
@@ -356,6 +395,7 @@ export class BeneficiariesService {
         status: b.status,
         dataSaida: b.dataSaida,
 
+        // Operadora
         Empresa: o?.empresa ?? null,
         Cpf: o?.cpfOperadora ?? null,
         Usuario: o?.usuario ?? null,
@@ -463,6 +503,7 @@ export class BeneficiariesService {
     const updatedDetails: UpdatedDetail[] = [];
     const dupMap = new Map<string, number[]>();
 
+    // cache de titulares já existentes
     const titularesCache = new Map<string, string>();
     const titularesExistentes = await this.prisma.beneficiario.findMany({
       where: { clientId, tipo: BeneficiarioTipo.TITULAR },
@@ -472,6 +513,43 @@ export class BeneficiariesService {
       if (t.cpf) titularesCache.set(t.cpf, t.id);
     });
 
+    /* =========================================================
+     * PRÉ-PASSO: Cpf_Dependente “vazado” na linha do TITULAR.
+     * Guardar a dica apenas se for um CPF válido e DIFERENTE
+     * do CPF do titular; colar no dependente seguinte da MESMA
+     * família (familyKey).
+     * =======================================================*/
+    let lastTitularKey: string | null = null;
+    let carriedCpfDep: string | null = null;
+
+    for (const r of rows) {
+      const tipoStr = norm(r['Tipo_Usuario'] ?? r['Parentesco']);
+      const key = familyKey(r);
+
+      if (tipoStr.startsWith('TITULAR')) {
+        lastTitularKey = key;
+
+        const titularCpf = digitsOnly(r['Cpf'] || '');
+        const depOnTit = digitsOnly(r['Cpf_Dependente'] || '');
+
+        const isValidDepOnTit =
+          depOnTit.length === 11 && depOnTit !== titularCpf;
+
+        carriedCpfDep = isValidDepOnTit ? depOnTit : null;
+      } else {
+        const ownDep = digitsOnly(r['Cpf_Dependente'] || '');
+        if (!ownDep && carriedCpfDep && key === lastTitularKey) {
+          (r as any)._cpfDepFallback = carriedCpfDep; // cola a dica
+          carriedCpfDep = null; // consome
+        }
+        if (key !== lastTitularKey) {
+          carriedCpfDep = null;
+          lastTitularKey = key;
+        }
+      }
+    }
+
+    // ================= transação =================
     await this.prisma.$transaction(
       async (tx) => {
         for (let i = 0; i < rows.length; i++) {
@@ -483,55 +561,151 @@ export class BeneficiariesService {
             const tipoUsuario = r['Tipo_Usuario'];
             const grauParentesco = r['Grau_Parentesco'];
 
-            const cpfTitularCsv = normalizeCpf(r['Cpf']);
-            const cpfDependenteCsv = normalizeCpf(r['Cpf_Dependente']);
-
             const isTitularCsv = norm(tipoUsuario).startsWith('TITULAR');
             const tipo = normalizeTipoFromCsv(tipoUsuario, grauParentesco);
 
-            const cpf = isTitularCsv ? cpfTitularCsv : cpfDependenteCsv;
+            const rawCpfTitular = digitsOnly(r['Cpf']);
+            const rawCpfDepend = digitsOnly(r['Cpf_Dependente']);
+            const hintedCpfDep = digitsOnly((r as any)._cpfDepFallback || '');
 
             if (!usuario) {
               summary.rejeitados++;
-              errors.push({ row: rowNum, motivo: 'Nome (Usuario) vazio', dados: r });
+              errors.push({
+                row: rowNum,
+                motivo: 'Nome (Usuario) vazio',
+                dados: r,
+              });
               continue;
             }
 
-            const dtAdmissao = entradaFromCsv(r['Dt_Admissao'], r['Data_Cadastro']);
+            // datas e status
+            const dtEntrada = entradaFromCsv(
+              r['Data_Cadastro'],
+              r['Dt_Admissao'],
+            );
             const dtCancelamento = saidaFromCsv(r['Dt_Cancelamento']);
             const st = statusFromCsv(r['Dt_Cancelamento']);
+            const dataNascimento =
+              parseDateFlexible(r['Data_Nascimento']) ?? undefined;
+            const sexo = (() => {
+              const s = norm(r['Sexo']);
+              if (s.startsWith('M')) return 'M';
+              if (s.startsWith('F')) return 'F';
+              return undefined;
+            })();
 
-            const dataNascimento = parseDateFlexible(r['Data_Nascimento']) ?? undefined;
-            const sexo = toSexo(r['Sexo']);
-
+            // titularId (para dependentes)
             let titularId: string | undefined;
-            if (!isTitularCsv && cpfTitularCsv) {
-              titularId = titularesCache.get(cpfTitularCsv);
-              if (!titularId) {
-                const t = await tx.beneficiario.findFirst({
-                  where: { clientId, tipo: BeneficiarioTipo.TITULAR, cpf: cpfTitularCsv },
-                  select: { id: true },
-                });
-                if (t) {
-                  titularId = t.id;
-                  titularesCache.set(cpfTitularCsv, t.id);
+            if (!isTitularCsv && rawCpfTitular) {
+              const titularCpfNorm = padCpfTo11(rawCpfTitular);
+              if (titularCpfNorm) {
+                titularId = titularesCache.get(titularCpfNorm);
+                if (!titularId) {
+                  const t = await tx.beneficiario.findFirst({
+                    where: {
+                      clientId,
+                      tipo: BeneficiarioTipo.TITULAR,
+                      cpf: titularCpfNorm,
+                    },
+                    select: { id: true },
+                  });
+                  if (t) {
+                    titularId = t.id;
+                    titularesCache.set(titularCpfNorm, t.id);
+                  }
                 }
               }
             }
 
-            let existing:
-              | null
-              | { id: string; cpf: string | null; dataNascimento: Date | null; nomeCompleto: string | null } =
-              null;
+            // ======== ESCOLHA DO CPF (dependente) =========
+            let chosenRaw = isTitularCsv
+              ? rawCpfTitular
+              : rawCpfDepend || hintedCpfDep || '';
 
-            if (cpf) {
-              existing = await tx.beneficiario.findFirst({
-                where: { clientId, cpf },
-                select: { id: true, cpf: true, dataNascimento: true, nomeCompleto: true },
+            // se o "escolhido" para o dependente for igual ao CPF do titular, ignore
+            if (
+              !isTitularCsv &&
+              chosenRaw &&
+              rawCpfTitular &&
+              chosenRaw === rawCpfTitular
+            ) {
+              chosenRaw = '';
+            }
+
+            // Se ainda ficou vazio, e houver titular + nome, tenta corrigir pelo cadastro
+            if (!isTitularCsv && !chosenRaw && titularId && usuario) {
+              const dep = await tx.beneficiario.findFirst({
+                where: {
+                  clientId,
+                  titularId,
+                  nomeCompleto: { equals: usuario, mode: 'insensitive' },
+                },
+                select: { cpf: true },
+              });
+              if (dep?.cpf) chosenRaw = dep.cpf;
+            }
+
+            // normalização/validação
+            const cpfInfo = normalizeCpfFromLayout(chosenRaw);
+
+            if (cpfInfo.status === 'adjusted') {
+              errors.push({
+                row: rowNum,
+                motivo: 'CPF ajustado',
+                dados: {
+                  cpfBruto: chosenRaw,
+                  mensagem: cpfInfo.message,
+                  cpfAjustado: cpfInfo.clean,
+                },
+              });
+            } else if (cpfInfo.status === 'invalid') {
+              errors.push({
+                row: rowNum,
+                motivo: 'CPF inválido',
+                dados: { cpfBruto: chosenRaw, mensagem: cpfInfo.message },
+              });
+            } else if (cpfInfo.status === 'missing') {
+              errors.push({
+                row: rowNum,
+                motivo: 'CPF ausente',
+                dados: { mensagem: cpfInfo.message },
               });
             }
 
-            let matchBy: 'CPF' | 'NOME_DTNASC' = 'CPF';
+            // tentativa de match existente
+            let existing:
+              | null
+              | {
+                  id: string;
+                  cpf: string | null;
+                  dataNascimento: Date | null;
+                  nomeCompleto: string | null;
+                } = null;
+            let matchBy: 'CPF' | 'NOME_DTNASC' | 'CPF_LEGACY' = 'CPF';
+
+            if (cpfInfo.clean) {
+              existing = await tx.beneficiario.findFirst({
+                where: { clientId, cpf: cpfInfo.clean },
+                select: {
+                  id: true,
+                  cpf: true,
+                  dataNascimento: true,
+                  nomeCompleto: true,
+                },
+              });
+            }
+            if (!existing && chosenRaw.length > 0) {
+              existing = await tx.beneficiario.findFirst({
+                where: { clientId, cpf: chosenRaw },
+                select: {
+                  id: true,
+                  cpf: true,
+                  dataNascimento: true,
+                  nomeCompleto: true,
+                },
+              });
+              if (existing) matchBy = 'CPF_LEGACY';
+            }
             if (!existing && usuario && dataNascimento) {
               existing = await tx.beneficiario.findFirst({
                 where: {
@@ -539,18 +713,28 @@ export class BeneficiariesService {
                   nomeCompleto: { equals: usuario, mode: 'insensitive' },
                   dataNascimento: dataNascimento as any,
                 },
-                select: { id: true, cpf: true, dataNascimento: true, nomeCompleto: true },
+                select: {
+                  id: true,
+                  cpf: true,
+                  dataNascimento: true,
+                  nomeCompleto: true,
+                },
               });
               if (existing) matchBy = 'NOME_DTNASC';
             }
 
+            // NUNCA sobrescrever CPF existente com null
+            const finalCpf: string | null =
+              (cpfInfo.clean as any) ?? existing?.cpf ?? null;
+
+            // core data
             const coreData: Prisma.BeneficiarioUncheckedCreateInput = {
               clientId,
               titularId: titularId ?? null,
               nomeCompleto: usuario,
-              cpf: cpf || null,
+              cpf: finalCpf, // uso do CPF final protegido
               tipo,
-              dataEntrada: dtAdmissao,
+              dataEntrada: dtEntrada,
               dataSaida: dtCancelamento ?? null,
               status: st,
               sexo: (sexo as any) ?? null,
@@ -569,9 +753,12 @@ export class BeneficiariesService {
               observacoes: null,
             };
 
-            /* --------- NOVO: calcula valorMensalidade a partir do plano do CSV --------- */
+            // preço por plano (opcional)
             const planoDoCsv = r['Plano'] ?? coreData.plano;
-            const resolved = await this.resolvePlanForClient(clientId, planoDoCsv);
+            const resolved = await this.resolvePlanForClient(
+              clientId,
+              planoDoCsv,
+            );
             if (resolved) {
               const price = await this.pickClientPlanPrice(
                 clientId,
@@ -579,69 +766,69 @@ export class BeneficiariesService {
                 coreData.faixaEtaria ?? undefined,
               );
               if (price?.valor != null) {
-                // Prisma aceita Decimal diretamente
-                coreData.valorMensalidade = price.valor as unknown as Prisma.Decimal;
+                coreData.valorMensalidade =
+                  price.valor as unknown as Prisma.Decimal;
               }
             }
-            /* -------------------------------------------------------------------------- */
 
-            // ====== Dados da relação 1:1 (string para campos de data) ======
-            const opCreateData: Prisma.BeneficiarioOperadoraCreateWithoutBeneficiarioInput = {
-              empresa: r['Empresa'] ?? null,
-              cpfOperadora: cpfTitularCsv || null,
-              usuario: r['Usuario'] ?? null,
-              nomeSocial: r['Nm_Social'] ?? null,
-              estadoCivil: r['Estado_Civil'] ?? null,
-              dataNascimentoOperadora: toIsoStringOrNull(r['Data_Nascimento']),
-              sexoOperadora: r['Sexo'] ?? null,
-              identidade: r['Identidade'] ?? null,
-              orgaoExpedidor: r['Orgao_Exp'] ?? null,
-              ufOrgao: r['Uf_Orgao'] ?? null,
-              ufEndereco: r['Uf_Endereco'] ?? null,
-              cidade: r['Cidade'] ?? null,
-              tipoLogradouro: r['Tipo_Logradouro'] ?? null,
-              logradouro: r['Logradouro'] ?? null,
-              numero: r['Numero'] ?? null,
-              complemento: r['Complemento'] ?? null,
-              bairro: r['Bairro'] ?? null,
-              cep: r['Cep'] ?? null,
-              fone: r['Fone'] ?? null,
-              celular: r['Celular'] ?? null,
-              planoOperadora: r['Plano'] ?? null,
-              matriculaOperadora: r['Matricula'] ?? null,
-              filial: r['Filial'] ?? null,
-              codigoUsuario: r['Codigo_Usuario'] ?? null,
-              dataAdmissao: toIsoStringOrNull(r['Dt_Admissao']),
-              codigoCongenere: r['Codigo_Congenere'] ?? null,
-              nomeCongenere: r['Nm_Congenere'] ?? null,
-              tipoUsuario: r['Tipo_Usuario'] ?? null,
-              nomeMae: r['Nome_Mae'] ?? null,
-              pis: r['Pis'] ?? null,
-              cns: r['Cns'] ?? null,
-              ctps: r['Ctps'] ?? null,
-              serieCtps: r['Serie_Ctps'] ?? null,
-              dataProcessamento: toIsoStringOrNull(r['Data_Processamento']),
-              dataCadastro: toIsoStringOrNull(r['Data_Cadastro']),
-              unidade: r['Unidade'] ?? null,
-              descricaoUnidade: r['Descricao_Unidade'] ?? null,
-              cpfDependente: cpfDependenteCsv || null,
-              grauParentesco: r['Grau_Parentesco'] ?? null,
-              dataCasamento: toIsoStringOrNull(r['Dt_Casamento']),
-              nuRegistroPessoaNatural: r['Nu_Registro_Pessoa_Natural'] ?? null,
-              cdTabela: r['Cd_Tabela'] ?? null,
-              empresaUtilizacao: r['Empresa_Utilizacao'] ?? null,
-              dataCancelamento: toIsoStringOrNull(r['Dt_Cancelamento']),
-            };
+            // dados operadora — refletir CPF efetivo do dependente
+            const opCreateData: Prisma.BeneficiarioOperadoraCreateWithoutBeneficiarioInput =
+              {
+                empresa: r['Empresa'] ?? null,
+                cpfOperadora: rawCpfTitular || null, // CPF “Cpf” do layout (titular)
+                usuario: r['Usuario'] ?? null,
+                nomeSocial: r['Nm_Social'] ?? null,
+                estadoCivil: r['Estado_Civil'] ?? null,
+                dataNascimentoOperadora: toIsoStringOrNull(
+                  r['Data_Nascimento'],
+                ),
+                sexoOperadora: r['Sexo'] ?? null,
+                identidade: r['Identidade'] ?? null,
+                orgaoExpedidor: r['Orgao_Exp'] ?? null,
+                ufOrgao: r['Uf_Orgao'] ?? null,
+                ufEndereco: r['Uf_Endereco'] ?? null,
+                cidade: r['Cidade'] ?? null,
+                tipoLogradouro: r['Tipo_Logradouro'] ?? null,
+                logradouro: r['Logradouro'] ?? null,
+                numero: r['Numero'] ?? null,
+                complemento: r['Complemento'] ?? null,
+                bairro: r['Bairro'] ?? null,
+                cep: r['Cep'] ?? null,
+                fone: r['Fone'] ?? null,
+                celular: r['Celular'] ?? null,
+                planoOperadora: r['Plano'] ?? null,
+                matriculaOperadora: r['Matricula'] ?? null,
+                filial: r['Filial'] ?? null,
+                codigoUsuario: r['Codigo_Usuario'] ?? null,
+                dataAdmissao: toIsoStringOrNull(r['Dt_Admissao']),
+                codigoCongenere: r['Codigo_Congenere'] ?? null,
+                nomeCongenere: r['Nm_Congenere'] ?? null,
+                tipoUsuario: r['Tipo_Usuario'] ?? null,
+                nomeMae: r['Nome_Mae'] ?? null,
+                pis: r['Pis'] ?? null,
+                cns: r['Cns'] ?? null,
+                ctps: r['Ctps'] ?? null,
+                serieCtps: r['Serie_Ctps'] ?? null,
+                dataProcessamento: toIsoStringOrNull(r['Data_Processamento']),
+                dataCadastro: toIsoStringOrNull(r['Data_Cadastro']),
+                unidade: r['Unidade'] ?? null,
+                descricaoUnidade: r['Descricao_Unidade'] ?? null,
+                cpfDependente: isTitularCsv ? null : finalCpf, // usa CPF efetivo do dependente
+                grauParentesco: r['Grau_Parentesco'] ?? null,
+                dataCasamento: toIsoStringOrNull(r['Dt_Casamento']),
+                nuRegistroPessoaNatural:
+                  r['Nu_Registro_Pessoa_Natural'] ?? null,
+                cdTabela: r['Cd_Tabela'] ?? null,
+                empresaUtilizacao: r['Empresa_Utilizacao'] ?? null,
+                dataCancelamento: toIsoStringOrNull(r['Dt_Cancelamento']),
+              };
 
             const opUpdateData: Prisma.BeneficiarioOperadoraUpdateWithoutBeneficiarioInput =
               { ...opCreateData };
 
             if (!existing) {
               const created = await tx.beneficiario.create({
-                data: {
-                  ...coreData,
-                  operadora: { create: opCreateData },
-                },
+                data: { ...coreData, operadora: { create: opCreateData } },
                 select: { id: true, tipo: true, cpf: true, nomeCompleto: true },
               });
 
@@ -655,23 +842,33 @@ export class BeneficiariesService {
                 summary.porTipo!.titulares.criados++;
               else summary.porTipo!.dependentes.criados++;
 
-              // Loga definição de valorMensalidade quando veio do preço do plano
+              const changed: Diff[] = [];
               if (coreData.valorMensalidade != null) {
+                changed.push({
+                  scope: 'core',
+                  field: 'valorMensalidade',
+                  before: null,
+                  after: coreData.valorMensalidade,
+                });
+              }
+              if (cpfInfo.status === 'adjusted') {
+                changed.push({
+                  scope: 'core',
+                  field: 'cpf',
+                  before: null,
+                  after: coreData.cpf,
+                });
+              }
+
+              if (changed.length) {
                 updatedDetails.push({
                   row: rowNum,
                   id: created.id,
                   cpf: created.cpf,
                   nome: created.nomeCompleto,
                   tipo: created.tipo as any,
-                  matchBy: cpf ? 'CPF' : 'NOME_DTNASC',
-                  changed: [
-                    {
-                      scope: 'core',
-                      field: 'valorMensalidade',
-                      before: null,
-                      after: coreData.valorMensalidade,
-                    },
-                  ],
+                  matchBy: cpfInfo.clean ? 'CPF' : 'NOME_DTNASC',
+                  changed,
                 });
               }
             } else {
@@ -685,40 +882,42 @@ export class BeneficiariesService {
                 data: {
                   ...coreData,
                   operadora: {
-                    upsert: {
-                      create: opCreateData,
-                      update: opUpdateData,
-                    },
+                    upsert: { create: opCreateData, update: opUpdateData },
                   },
                 },
                 include: { operadora: true },
               });
 
               const changed: Diff[] = [];
-              const coreFieldsToTrack: (keyof Prisma.BeneficiarioUncheckedCreateInput)[] = [
-                'nomeCompleto',
-                'cpf',
-                'tipo',
-                'dataEntrada',
-                'dataSaida',
-                'status',
-                'sexo',
-                'dataNascimento',
-                'plano',
-                'matricula',
-                'estado',
-                'valorMensalidade', // <- passa a rastrear também
-              ];
-              coreFieldsToTrack.forEach((k) => {
+              (
+                [
+                  'nomeCompleto',
+                  'cpf',
+                  'tipo',
+                  'dataEntrada',
+                  'dataSaida',
+                  'status',
+                  'sexo',
+                  'dataNascimento',
+                  'plano',
+                  'matricula',
+                  'estado',
+                  'valorMensalidade',
+                ] as (keyof Prisma.BeneficiarioUncheckedCreateInput)[]
+              ).forEach((k) => {
                 const b = (before as any)?.[k];
                 const a = (upd as any)?.[k];
                 if (String(b ?? '') !== String(a ?? '')) {
-                  changed.push({ scope: 'core', field: String(k), before: b, after: a });
+                  changed.push({
+                    scope: 'core',
+                    field: String(k),
+                    before: b,
+                    after: a,
+                  });
                 }
               });
 
-              const opFields = Object.keys(opCreateData);
-              opFields.forEach((k) => {
+              Object.keys(opCreateData).forEach((k) => {
                 const b = (before as any)?.operadora?.[k];
                 const a = (upd as any)?.operadora?.[k];
                 if (String(b ?? '') !== String(a ?? '')) {
@@ -740,21 +939,23 @@ export class BeneficiariesService {
                 summary.porTipo!.titulares.atualizados++;
               else summary.porTipo!.dependentes.atualizados++;
 
-              updatedDetails.push({
-                row: rowNum,
-                id: upd.id,
-                cpf: upd.cpf,
-                nome: upd.nomeCompleto,
-                tipo: upd.tipo,
-                matchBy,
-                changed,
-              });
+              if (changed.length) {
+                updatedDetails.push({
+                  row: rowNum,
+                  id: upd.id,
+                  cpf: upd.cpf,
+                  nome: upd.nomeCompleto,
+                  tipo: upd.tipo,
+                  matchBy,
+                  changed,
+                });
+              }
             }
 
-            if (cpf) {
-              const arr = dupMap.get(cpf) ?? [];
+            if (cpfInfo.clean) {
+              const arr = dupMap.get(cpfInfo.clean) ?? [];
               arr.push(rowNum);
-              dupMap.set(cpf, arr);
+              dupMap.set(cpfInfo.clean, arr);
             }
           } catch (e: any) {
             summary.rejeitados++;
@@ -788,7 +989,6 @@ export class BeneficiariesService {
           data: { clientId, runId, latest: true, payload },
         });
       },
-      // aumenta timeout da transação interativa (default 5s) para evitar "expired transaction"
       { timeout: 120_000 },
     );
 
