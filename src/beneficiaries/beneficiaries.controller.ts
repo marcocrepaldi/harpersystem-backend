@@ -19,6 +19,30 @@ import { BeneficiariesService } from './beneficiaries.service';
 
 type PageResult<T> = { items: T[]; page: number; limit: number; total: number };
 
+/* ---------------- helpers só para o PATCH ---------------- */
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function toDate(value: any): Date | undefined {
+  if (value == null || String(value).trim() === '') return undefined;
+  let s = String(value).trim();
+  if (DATE_RE.test(s)) s = `${s}T00:00:00.000Z`;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? undefined : d;
+}
+const onlyDigits = (s: any) => String(s ?? '').replace(/\D/g, '');
+const nullIfEmpty = (v: any) => {
+  if (v == null) return null;
+  const t = String(v).trim();
+  return t === '' ? null : t;
+};
+function normalizeTipo(v: any) {
+  const s = String(v ?? '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toUpperCase().trim();
+  if (!s) return undefined;
+  if (s === 'DEPENDENTE') return 'FILHO';
+  if (s === 'CONJUGUE' || s === 'CONJUGE') return 'CONJUGE';
+  if (s === 'FILHO' || s === 'CONJUGE' || s === 'TITULAR') return s;
+  return undefined;
+}
+
 @Controller('clients/:clientId/beneficiaries')
 export class BeneficiariesController {
   constructor(private readonly svc: BeneficiariesService) {}
@@ -60,9 +84,54 @@ export class BeneficiariesController {
     if (!delegate) {
       throw new BadRequestException('Delegate Prisma para beneficiários não encontrado.');
     }
+
+    // monta um "data" seguro para o Prisma (sem alterar as outras rotas)
+    const data: Record<string, any> = { clientId };
+
+    if (dto.nomeCompleto !== undefined) data.nomeCompleto = nullIfEmpty(dto.nomeCompleto);
+    if (dto.cpf !== undefined) {
+      const digits = onlyDigits(dto.cpf);
+      data.cpf = digits.length ? digits : null;
+    }
+    if (dto.tipo !== undefined) {
+      const t = normalizeTipo(dto.tipo);
+      if (t) data.tipo = t; // "FILHO" | "CONJUGE" | "TITULAR"
+    }
+
+    if (dto.dataEntrada !== undefined) {
+      const d = toDate(dto.dataEntrada);
+      if (!d) throw new BadRequestException('dataEntrada inválida (use YYYY-MM-DD).');
+      data.dataEntrada = d;
+    }
+    if (dto.dataNascimento !== undefined) {
+      const d = toDate(dto.dataNascimento);
+      data.dataNascimento = d ?? null;
+    }
+    if (dto.dataSaida !== undefined) {
+      const d = toDate(dto.dataSaida);
+      data.dataSaida = d ?? null;
+      // se quiser, pode forçar INATIVO quando houver saída (opcional)
+      // if (d && dto.status === undefined) data.status = 'INATIVO';
+    }
+
+    if (dto.valorMensalidade !== undefined) data.valorMensalidade = nullIfEmpty(dto.valorMensalidade);
+    if (dto.titularId !== undefined) data.titularId = nullIfEmpty(dto.titularId);
+
+    if (dto.matricula !== undefined) data.matricula = nullIfEmpty(dto.matricula);
+    if (dto.carteirinha !== undefined) data.carteirinha = nullIfEmpty(dto.carteirinha);
+    if (dto.sexo !== undefined) data.sexo = nullIfEmpty(dto.sexo);
+    if (dto.plano !== undefined) data.plano = nullIfEmpty(dto.plano);
+    if (dto.centroCusto !== undefined) data.centroCusto = nullIfEmpty(dto.centroCusto);
+    if (dto.faixaEtaria !== undefined) data.faixaEtaria = nullIfEmpty(dto.faixaEtaria);
+    if (dto.estado !== undefined) data.estado = nullIfEmpty(dto.estado);
+    if (dto.status !== undefined) data.status = dto.status;
+    if (dto.regimeCobranca !== undefined) data.regimeCobranca = dto.regimeCobranca;
+    if (dto.motivoMovimento !== undefined) data.motivoMovimento = dto.motivoMovimento;
+    if (dto.observacoes !== undefined) data.observacoes = dto.observacoes ?? null;
+
     return delegate.update({
       where: { id: beneficiaryId },
-      data: { ...dto, clientId },
+      data,
     });
   }
 
