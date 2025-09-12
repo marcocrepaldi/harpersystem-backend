@@ -1,0 +1,28 @@
+# dependências e artefatos locais
+node_modules
+dist
+coverage
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# VCS / IDE
+.git
+.gitignore
+.vscode
+.idea
+
+# SO
+.DS_Store
+Thumbs.db
+
+# envs e segredos (serão injetados via env_file no compose)
+.env
+.env.*
+!.env.example
+
+# caches
+.npm
+.pnpm-store
+.cache
